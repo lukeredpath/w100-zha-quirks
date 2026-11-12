@@ -1069,19 +1069,17 @@ class W100FanCluster(CustomCluster, Fan):
         if "fan_mode" in attributes or 0x0000 in attributes:
             val = attributes.get("fan_mode", attributes.get(0x0000))
             # The device only has Auto and three speeds; anything else (Off,
-            # On, Smart) is sent as Auto. Store what was actually sent so HA
-            # shows what the device shows.
-            effective = val if val in FAN_MODE_TO_S else Fan.FanMode.Auto
+            # On, Smart) is sent as Auto (S0). The value HA wrote is kept, so
+            # e.g. Off stays Off in HA while the device displays AUTO.
             _LOGGER.debug(
-                "W100FanCluster: Writing fan_mode %s -> %s (S=%s)",
+                "W100FanCluster: Writing fan_mode %s -> S=%s",
                 val,
-                effective,
-                FAN_MODE_TO_S.get(effective, 0),
+                FAN_MODE_TO_S.get(val, 0),
             )
 
             # The PMTSD S value is derived from this attribute, so update it
             # first and then send the current state.
-            self._update_attribute(FAN_MODE_ATTR, effective)
+            self._update_attribute(FAN_MODE_ATTR, val)
 
             ep1 = self.endpoint.device.endpoints.get(1)
             manu_cluster = ep1.in_clusters.get(W100ManuSpecificCluster.cluster_id) if ep1 else None

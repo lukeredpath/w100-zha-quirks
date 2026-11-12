@@ -227,11 +227,11 @@ async def test_fan_read_after_restart_keeps_persisted_mode(w100):
         (Fan.FanMode.Medium, 2, Fan.FanMode.Medium),
         (Fan.FanMode.High, 3, Fan.FanMode.High),
         (Fan.FanMode.Auto, 0, Fan.FanMode.Auto),
-        # The device has no off/on/smart: these are sent, and stored, as Auto
-        # so HA shows what the device displays.
-        (Fan.FanMode.Off, 0, Fan.FanMode.Auto),
-        (Fan.FanMode.On, 0, Fan.FanMode.Auto),
-        (Fan.FanMode.Smart, 0, Fan.FanMode.Auto),
+        # The device has no off/on/smart: these are sent as Auto, but HA keeps
+        # the value it wrote (Off stays Off in HA; the device shows AUTO).
+        (Fan.FanMode.Off, 0, Fan.FanMode.Off),
+        (Fan.FanMode.On, 0, Fan.FanMode.On),
+        (Fan.FanMode.Smart, 0, Fan.FanMode.Smart),
     ],
 )
 async def test_fan_write_sends_s(w100, mode, s, stored):

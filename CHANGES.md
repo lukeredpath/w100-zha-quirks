@@ -178,11 +178,10 @@ tell a change made on the device from one made by HA.
 
 ### Fan entity
 
-- **Off showed as off in HA but AUTO on the device.** The device has no fan
-  "off" (or the On/Smart presets ZHA also offers), so these are sent as Auto
-  (`S0`). Upstream stored the value HA wrote, so the entity said off while the
-  display showed AUTO. The value actually sent (Auto) is now stored, so the
-  entity shows the Auto preset.
+The device has no fan "off" (nor the On/Smart presets ZHA offers); these are
+sent as Auto (`S0`), and the entity keeps showing the value chosen in HA (see
+Known Issues in the README).
+
 - **The fan came up off with no preset after a restart.** ZHA reads
   `fan_mode` from the device at startup, but the fan cluster is virtual (on an
   endpoint the quirk adds), so the read failed. Reads are now answered from
