@@ -15,11 +15,19 @@ import sensor_ht_agl001 as quirk
 
 IEEE = t.EUI64.convert("54:ef:44:10:00:aa:bb:cc")
 
-# A device heartbeat/request: command byte 0x84 at index 3, end marker at the end.
-HEARTBEAT = bytes([0xAA, 0x71, 0x10, 0x84, 0x00, 0x00, 0x08, 0x44])
+# Frames captured from a real W100 on 2026-11-12.
+# A heartbeat/request: command byte 0x84 at index 3, counter 0x07, end marker at the end.
+HEARTBEAT = bytes.fromhex("aa710f84074b06410f000054ef4480711a08000844")
+HEARTBEAT_COUNTER = 0x07
 
 ON_FRAME_PREFIX = bytes.fromhex("aa713244")
 OFF_FRAME_PREFIX = bytes.fromhex("aa711c44")
+ACK_COMMAND = 0x24
+
+
+def header_checksum_ok(frame: bytes) -> bool:
+    """Lumi header checksum: bytes 0-5 sum to 0 mod 256."""
+    return sum(frame[:6]) & 0xFF == 0
 
 
 def write_response(status: foundation.Status) -> foundation.WriteAttributesResponseSchema:
@@ -31,14 +39,25 @@ def write_response(status: foundation.Status) -> foundation.WriteAttributesRespo
     )
 
 
-def pmtsd_frame(payload: str) -> bytes:
-    """A device-reported PMTSD data frame carrying the given ASCII payload."""
+def pmtsd_frame(payload: str, counter: int = 0x0A) -> bytes:
+    """A device-originated PMTSD data frame, in the layout the real W100 uses.
+
+    e.g. aa 72 17 84 0a 3f 01 41 17 00 00 54 ef 44 80 71 1a 08 00 08 44 06 "M1_T24" 00
+    """
     data = payload.encode("ascii")
-    return bytes([0xAA, 0x71, 0x20, 0x44]) + b"\x00" * 4 + b"\x08\x44" + bytes([len(data)]) + data
+    return (
+        bytes([0xAA, 0x72, 0x00, 0x84, counter, 0x00, 0x01, 0x41, 0x00, 0x00, 0x00])
+        + bytes.fromhex("54ef4480711a08000844")
+        + bytes([len(data)])
+        + data
+        + b"\x00"
+    )
 
 
 def describe(frame: bytes) -> str:
-    """Summarise a written control frame as 'ON', 'OFF' or its PMTSD string."""
+    """Summarise a written control frame as 'ACK', 'ON', 'OFF' or its PMTSD string."""
+    if frame[3] == ACK_COMMAND:
+        return "ACK"
     if frame.startswith(ON_FRAME_PREFIX):
         return "ON"
     if frame.startswith(OFF_FRAME_PREFIX):
@@ -63,7 +82,13 @@ class W100:
 
     @property
     def frames(self) -> list[str]:
-        return [describe(w) for w in self.writes]
+        """Frames written, excluding acknowledgements (see `acks`)."""
+        return [d for d in (describe(w) for w in self.writes) if d != "ACK"]
+
+    @property
+    def acks(self) -> list[int]:
+        """Counters echoed by the acknowledgement frames written, in order."""
+        return [w[4] for w in self.writes if w[3] == ACK_COMMAND]
 
     def receive(self, data: bytes) -> None:
         """Simulate the device reporting a value on the 0xFFF2 control attribute."""

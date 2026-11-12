@@ -2,6 +2,7 @@
 import asyncio
 from enum import IntEnum
 import logging
+import math
 import random
 import struct
 import time
@@ -91,6 +92,11 @@ S_TO_FAN_MODE = {
     3: Fan.FanMode.High,
 }
 FAN_MODE_TO_S = {mode: s for s, mode in S_TO_FAN_MODE.items()}
+
+
+def whole_degrees(value: float) -> int:
+    """Round a temperature to whole degrees (half up), as the W100 protocol requires."""
+    return int(math.floor(float(value) + 0.5))
 
 
 def _find_w100_thermostat(device) -> Optional["W100ThermostatCluster"]:
@@ -187,6 +193,8 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         # Strong references to fire-and-forget tasks so they aren't GC'd
         # before completion.
         self._background_tasks: set[asyncio.Task] = set()
+        # Outgoing PMTSD frame counter; incremented per frame like the device's.
+        self._frame_counter = random.randint(0, 255)
 
     @property
     def _cached_external_temperature(self) -> float:
@@ -628,16 +636,25 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         if idx == -1:
             return
 
+        # Frames the device originates (byte 3 == 0x84: heartbeats/requests and
+        # local state changes) must be acknowledged, or the device holds back
+        # further local changes and eventually shows E02. See
+        # https://github.com/Koenkk/zigbee2mqtt/issues/33469
+        device_counter = data[4] if len(data) >= 5 and data[3] == 0x84 else None
+
         if idx + 2 >= len(data):
-            # Check for heartbeat/request (0x84 command)
-            if len(data) >= 4 and data[3] == 0x84:
-                 _LOGGER.debug(
-                     "W100ManuSpecificCluster: Received heartbeat/request "
-                     "(feature_on=%s).",
-                     self._thermostat_feature_on,
-                 )
-                 self._spawn(self._reply_to_heartbeat(), "heartbeat reply")
+            # Heartbeat/request (0x84 command with no payload)
+            if device_counter is not None:
+                _LOGGER.debug(
+                    "W100ManuSpecificCluster: Received heartbeat/request "
+                    "(feature_on=%s).",
+                    self._thermostat_feature_on,
+                )
+                self._spawn(self._reply_to_heartbeat(device_counter), "heartbeat reply")
             return
+
+        if device_counter is not None:
+            self._spawn(self._send_ack(device_counter), "acknowledgement")
 
         payload_len = data[idx + 2]
         payload_start = idx + 3
@@ -693,7 +710,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             # back on restores it.
             thermostat._last_m = int(updates["M"])
         if "T" in updates:
-            thermostat.set_setpoint(updates["T"] * 100)
+            thermostat.set_setpoint(updates["T"] * 100, from_ha=False)
         if "D" in updates:
             thermostat._cached_d = updates["D"]
 
@@ -730,8 +747,27 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         thermostat.update_attribute(SYSTEM_MODE_ATTR, mode)
         thermostat.recalculate_running_state()
 
-    async def _reply_to_heartbeat(self):
-        """Reply to the device's PMTSD heartbeat/request, switch-aware.
+    @staticmethod
+    def _header_checksum(frame) -> int:
+        """Lumi header checksum (byte 5): bytes 0-5 sum to 0 mod 256."""
+        return (256 - (sum(frame[:5]) & 0xFF)) & 0xFF
+
+    def _next_counter(self) -> int:
+        """Per-device incrementing frame counter (byte 4), as the device uses."""
+        self._frame_counter = (self._frame_counter + 1) & 0xFF
+        return self._frame_counter
+
+    async def _send_ack(self, counter: int) -> None:
+        """Acknowledge a device-originated frame, echoing its counter."""
+        ack = bytearray(
+            [0xAA, 0x71, 0x0D, 0x24, counter & 0xFF, 0x00, 0x05, 0x41, 0x0A,
+             0x00, 0x00, 0x00, 0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A, 0x00]
+        )
+        ack[5] = self._header_checksum(ack)
+        await self._write_w100_control_frame(bytes(ack))
+
+    async def _reply_to_heartbeat(self, counter: int):
+        """Acknowledge the device's PMTSD heartbeat/request, then reply, switch-aware.
 
         Hardware testing showed the device only sends these heartbeat requests
         while it is in thermostat mode, and that it reverts to thermostat mode
@@ -743,6 +779,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
 
         While the switch is ON, reply with the cached PMTSD (HVAC state).
         """
+        await self._send_ack(counter)
         if not self._thermostat_feature_on:
             _LOGGER.debug("W100: Heartbeat while switch off -- re-asserting OFF frame")
             await self._write_w100_control_frame(self._build_thermostat_off_frame())
@@ -760,29 +797,38 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             await self.send_pmtsd(*thermostat.pmtsd_state())
 
     async def send_pmtsd(self, p, m, t_val, s, d):
-        """Send PMTSD command."""
+        """Send PMTSD command.
+
+        Any field passed as None is left out of the frame (the device sends
+        partial PMTSD itself, e.g. "M1_T24"). This is used to omit T when the
+        only setpoint we know is one the device reported, since the device
+        rounds its reports to whole degrees.
+
+        T is sent as whole degrees: the protocol only carries integers, and a
+        decimal T (e.g. "T20.5") has been seen to cause E01 on the device.
+        """
+        if t_val is not None:
+            t_val = whole_degrees(t_val)
         # Format: P{P}_M{M}_T{T}_S{S}_D{D}
-        pmtsd_str = f"P{p}_M{m}_T{t_val}_S{s}_D{d}"
+        fields = (("P", p), ("M", m), ("T", t_val), ("S", s), ("D", d))
+        pmtsd_str = "_".join(f"{key}{value}" for key, value in fields if value is not None)
         _LOGGER.debug("W100: Sending PMTSD: %s", pmtsd_str)
         pmtsd_bytes = pmtsd_str.encode("ascii")
         pmtsd_len = len(pmtsd_bytes)
 
-        fixed_header = bytearray([
-            0xAA, 0x71, 0x1F, 0x44,
-            0x00, 0x00, 0x05, 0x41, 0x1C,
+        # Lumi length fields (byte 2 = total - 6, byte 8 = total - 9). These
+        # used to be hardcoded as 0x1F/0x1C, which is only correct for a
+        # 15-character PMTSD string. Byte 16 (0x1A) is part of a fixed
+        # sequence and must not change. See zigbee2mqtt issue #33469.
+        body_len = 13 + pmtsd_len
+        full_payload = bytearray([
+            0xAA, 0x71, (body_len + 3) & 0xFF, 0x44,
+            self._next_counter(), 0x00, 0x05, 0x41, body_len & 0xFF,
             0x00, 0x00,
             0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A,
             0x08, 0x00, 0x08, 0x44, pmtsd_len,
-        ])
-
-        counter = random.randint(0, 255)
-        fixed_header[4] = counter
-
-        full_payload = fixed_header + pmtsd_bytes
-        
-        # Checksum calculation: sum of all bytes & 0xFF
-        checksum = sum(full_payload) & 0xFF
-        full_payload[5] = checksum
+        ]) + pmtsd_bytes
+        full_payload[5] = self._header_checksum(full_payload)
 
         await self._write_w100_control_frame(full_payload)
 
@@ -1020,6 +1066,10 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
         self._last_m = 0
         # PMTSD D value; its meaning is unknown, so it is just echoed back.
         self._cached_d = 0
+        # Whether the current setpoint was set by HA (exact) rather than learned
+        # from a device report (rounded to whole degrees). Not persisted: after
+        # a restart the source is unknown, so T is left out until HA sets one.
+        self._setpoint_from_ha = False
         super().__init__(*args, **kwargs)
         self._seed_defaults()
 
@@ -1047,7 +1097,14 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
         setpoint_attr = (
             COOLING_SETPOINT_ATTR if mode == Thermostat.SystemMode.Cool else HEATING_SETPOINT_ATTR
         )
-        t_val = self.get(setpoint_attr, self._DEFAULT_SETPOINT) / 100.0
+        # Only assert a setpoint HA set itself. One learned from a device report
+        # may be rounded (the device reports whole degrees), and sending it back
+        # would overwrite a half-degree setpoint the user chose on the device.
+        t_val = (
+            self.get(setpoint_attr, self._DEFAULT_SETPOINT) / 100.0
+            if self._setpoint_from_ha
+            else None
+        )
 
         s = 0
         ep21 = self.endpoint.device.endpoints.get(21)
@@ -1057,8 +1114,13 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
 
         return p, m, t_val, s, self._cached_d
 
-    def set_setpoint(self, value):
-        """Set both setpoints; the W100 has a single target temperature (T)."""
+    def set_setpoint(self, value, *, from_ha: bool):
+        """Set both setpoints; the W100 has a single target temperature (T).
+
+        from_ha records whether the value is exact (set by HA) or came from a
+        device report (possibly rounded); see pmtsd_state.
+        """
+        self._setpoint_from_ha = from_ha
         self.update_attribute(HEATING_SETPOINT_ATTR, value)
         self.update_attribute(COOLING_SETPOINT_ATTR, value)
 
@@ -1123,7 +1185,9 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
 
             if attr_id in (HEATING_SETPOINT_ATTR, COOLING_SETPOINT_ATTR):
                 # Single target temperature on the device: keep both in step.
-                self.set_setpoint(value)
+                # The protocol only carries whole degrees, so store what the
+                # device will actually use and HA shows the real setpoint.
+                self.set_setpoint(whole_degrees(value / 100) * 100, from_ha=True)
             else:
                 # system_mode writes also update _last_m via _update_attribute.
                 self._update_attribute(attr_id, value)

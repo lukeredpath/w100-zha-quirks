@@ -95,12 +95,51 @@ These values are now worked out from the attributes zigpy saves:
 | --- | --- |
 | `P` | `system_mode` (`Off` → `1`, otherwise `0`) |
 | `M` | `system_mode` (`Cool`/`Heat`/`Auto` → `0`/`1`/`2`). While off, the last active mode is used. |
-| `T` | the heating setpoint, or the cooling setpoint in `Cool` mode |
+| `T` | the heating setpoint, or the cooling setpoint in `Cool` mode, in whole degrees. Only sent if HA set the setpoint itself; see [PMTSD protocol fixes](#pmtsd-protocol-fixes). |
 | `S` | the fan cluster's `fan_mode` |
 | `D` | the last value the device reported, echoed back (its meaning is unknown; not saved, so `0` after a restart until the device reports it) |
 
 The device has a single target temperature, so writing either setpoint now
 updates both.
+
+### PMTSD protocol fixes
+
+Hardware testing on 2026-11-12, together with the protocol analysis in
+[zigbee2mqtt #33469](https://github.com/Koenkk/zigbee2mqtt/issues/33469), turned
+up several problems with how upstream talks to the W100 in thermostat mode. Z2M
+has the same problems.
+
+- **The device's frames were never acknowledged.** The W100 expects an
+  acknowledgement for every frame it sends (byte 3 = `0x84`): heartbeats and
+  state changes made on the device. Without one it holds back further local
+  changes and shows **E02**. We saw this on hardware: E02 appeared after a
+  local change, with a 74-second gap in heartbeats. Every such frame is now
+  answered with
+  `aa 71 0d 24 <counter> <checksum> 05 41 0a 00 00 00 54 ef 44 80 71 1a 00`,
+  echoing the device's counter. A heartbeat is acknowledged first and then
+  answered as before. The device's own `0x24` acknowledgements are not
+  answered.
+- **The PMTSD frame had hard-coded length bytes.** Bytes 2 and 8 were fixed
+  at `0x1F`/`0x1C`, which is only correct for a 15-character PMTSD string. They
+  are now worked out from the frame length (total − 6 and total − 9). Byte 16
+  (`0x1A`) belongs to a fixed sequence and stays as it is.
+- **The header checksum was wrong.** Byte 5 is now the Lumi header checksum,
+  `(256 − sum(bytes 0–4)) & 0xFF`, which every frame from the device satisfies.
+  Upstream summed the whole frame instead.
+- **The frame counter was random.** Byte 4 now increments for each frame, as
+  the device's own counter does.
+- **Setpoints were not whole degrees.** The protocol only carries whole
+  degrees: 23.5 set on the device is reported as `T23`, and a decimal `T` from
+  the hub has been seen to cause **E01**. `T` is now always sent as a whole
+  number. A setpoint written from HA is rounded (half up), and the rounded
+  value is stored, so the climate entity shows what the device actually has.
+- **A setpoint reported by the device was echoed back.** Heartbeat replies sent
+  the last setpoint the device reported, which is rounded down to a whole
+  degree. That overwrote a half-degree setpoint the user had chosen on the
+  device itself. On hardware, 23.5 became 23.0 and 24.5 became 24.0. `T` is now
+  left out of the PMTSD frame (for example `P0_M1_S0_D0`) unless HA set the
+  setpoint itself. After a restart the source of the stored setpoint is
+  unknown, so `T` is left out until HA sets one.
 
 ### Climate entity shown as "unknown" after a restart
 
@@ -175,6 +214,9 @@ quirk through ZHA's real device registry, with only the Zigbee radio mocked. It
 covers:
 
 - thermostat mode switching, heartbeat replies and control-frame write status
+- the PMTSD protocol (acknowledgements, frame layout, checksums, counters,
+  whole-degree setpoints), checked against frames captured from a real W100
+  and the reference frames in zigbee2mqtt #33469
 - behaviour after a restart, by mimicking how zigpy clears and restores the
   attribute cache on startup
 - `apply_custom_configuration`, including when individual steps fail
