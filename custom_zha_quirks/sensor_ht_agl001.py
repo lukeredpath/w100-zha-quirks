@@ -764,6 +764,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
              0x00, 0x00, 0x00, 0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A, 0x00]
         )
         ack[5] = self._header_checksum(ack)
+        _LOGGER.debug("W100: Acknowledging device frame (counter=0x%02X)", counter)
         await self._write_w100_control_frame(bytes(ack))
 
     async def _reply_to_heartbeat(self, counter: int):
