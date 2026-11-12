@@ -4,7 +4,7 @@ This custom quirk enables functionality for the Aqara W100 Climate Sensor in Hom
 
 ## Features
 
-- **Thermostat Control:** Climate entity with Heat, Cool, Auto (shown in Home Assistant as Heat/Cool) and Off modes, and a target temperature. Requires the Thermostat Mode Switch to be on.
+- **Thermostat Control:** Climate entity with Heat, Cool, Auto (shown in Home Assistant as Heat/Cool) and Off modes, and a target temperature. Takes effect on the device while the Thermostat Mode Switch is on; changes made while it's off are applied when it's turned on.
 - **Setpoint change tracking:** The "Setpoint change source" and "Setpoint change source timestamp" diagnostic sensors show whether the last setpoint change was made on the device (Manual) or from Home Assistant (External), and when.
 - **Fan Control:** Dedicated Fan entity (Endpoint 21) supporting Low, Medium, High, and Auto speeds.
 - **Sensors:** Temperature, Humidity, and Battery reporting.
@@ -46,7 +46,7 @@ This custom quirk enables functionality for the Aqara W100 Climate Sensor in Hom
 Turn this on to use the device as a thermostat. While it's on, the buttons change the mode and target temperature on the device, and those changes are sent to Home Assistant. While it's off, the quirk keeps the device in buttons-only mode: the device drifts back into thermostat mode on its own, and the quirk switches it back off the next time the device checks in.
 
 ### Thermostat
-The climate entity controls the device's system mode and target temperature (the Thermostat Mode Switch must be on).
+The climate entity controls the device's system mode and target temperature. While the Thermostat Mode Switch is off, the device ignores these changes; they're kept in Home Assistant and applied as soon as the switch is turned on.
 - **Heat / Cool / Heat/Cool (Auto):** Sets the device's mode.
 - **Off:** Turns the device's HVAC state off. It doesn't leave thermostat mode; use the Thermostat Mode Switch for that.
 - **Target temperature:** Whole degrees only; see [Known Issues](#known-issues).
