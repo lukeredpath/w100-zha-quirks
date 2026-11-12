@@ -1,6 +1,8 @@
 # Aqara W100 (lumi.sensor_ht.agl001) ZHA Quirk
 
-This custom quirk enables functionality for the Aqara W100 Climate Sensor in Home Assistant using ZHA (Zigbee Home Automation). It is mainly used for debugging and testing. By enabling Thermostat Mode Switch it is possible to control the middle display.
+This custom quirk enables functionality for the Aqara W100 Climate Sensor in Home Assistant using ZHA (Zigbee Home Automation). By enabling Thermostat Mode Switch it is possible to control the middle display.
+
+This is a maintained fork of [Pulzki/w100-zha-quirks](https://github.com/Pulzki/w100-zha-quirks), which wrote the original quirk. See [CHANGES.md](CHANGES.md) for what has changed since. Bug reports and questions go to [this repository's issues](https://github.com/lukeredpath/w100-zha-quirks/issues).
 
 ## Features
 
@@ -23,7 +25,7 @@ This custom quirk enables functionality for the Aqara W100 Climate Sensor in Hom
    - Create a folder named `custom_zha_quirks` (if it doesn't exist).
 
 2. **Copy the Quirk:**
-   - Download the `sensor_ht_agl001.py` file.
+   - Download `sensor_ht_agl001.py` from a [tagged release](https://github.com/lukeredpath/w100-zha-quirks/tags) (recommended), or the [latest version on `main`](https://raw.githubusercontent.com/lukeredpath/w100-zha-quirks/main/custom_zha_quirks/sensor_ht_agl001.py).
    - Place it inside the `custom_zha_quirks` folder.
 
 3. **Update Configuration:**
@@ -72,7 +74,7 @@ You can use the buttons in Home Assistant Automations.
 - **The T may briefly reappear after a Home Assistant restart.** With the switch off, the device can drift back into thermostat mode while Home Assistant is down. The quirk switches it back off when the device next checks in, usually within a minute or two.
 - **Some changes on the device aren't reflected in Home Assistant.** Some local changes (seen when cycling modes) arrive with an empty payload the quirk can't decode. Home Assistant catches up when the device next reports its state.
 - **The fan can't be turned off.** The device has no fan "off", only Auto and three speeds. ZHA's fan entity always offers Off (and the On and Smart presets); the quirk sends these as Auto. The entity shows what you picked (e.g. Off) while the display shows AUTO with three bars.
-- **E02 on the display.** E02 means the device sent a change and is waiting for the hub to confirm it. The quirk acknowledges and confirms every change, so it's expected to appear only while Home Assistant or ZHA is unavailable, clearing once they're back. (Confirmation is new; if you still see E02 in normal use, please report it with debug logs.)
+- **E02 on the display.** E02 means the device sent a change and is waiting for the hub to confirm it. The quirk acknowledges and confirms every change, so it's expected to appear only while Home Assistant or ZHA is unavailable, clearing once they're back. (Confirmation is new; if you still see E02 in normal use, please [report it](https://github.com/lukeredpath/w100-zha-quirks/issues) with debug logs.)
 
 ## Troubleshooting
 

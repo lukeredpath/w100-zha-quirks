@@ -5,11 +5,13 @@ Z2M model TH-S04D). Everything lives in one file,
 `custom_zha_quirks/sensor_ht_agl001.py`, which users copy into Home Assistant's
 `custom_zha_quirks` folder.
 
-- **Upstream:** `Pulzki/w100-zha-quirks`. `main` here mirrors upstream; don't commit
-  to it. Fork work happens on branches (current: `fix/review-findings`).
+- **This is the maintained fork** of `Pulzki/w100-zha-quirks`; upstream appears
+  unmaintained. `main` is the release branch: do work on a feature branch and
+  merge it into `main`.
+- **Releases** are git tags (`v1.0.0-beta.1`, ...). Add each release's notes to
+  `CHANGES.md` under a new version heading.
 - **Docs to keep in sync:** `README.md` (user-facing, including Known Issues) and
-  `CHANGES.md` (every difference from upstream). Update both when behaviour
-  changes.
+  `CHANGES.md` (the changelog). Update both when behaviour changes.
 
 ## Tests
 

@@ -1,14 +1,23 @@
-# Changes from upstream
+# Changelog
 
-This fork tracks [Pulzki/w100-zha-quirks](https://github.com/Pulzki/w100-zha-quirks).
-It is based on upstream `c335919` (merge of PR #6, external temperature/humidity
-sensor support). Every quirk change below is in
-`custom_zha_quirks/sensor_ht_agl001.py`. The fork also adds an automated test
-suite (see [Tests](#tests)).
+This is the maintained fork of
+[Pulzki/w100-zha-quirks](https://github.com/Pulzki/w100-zha-quirks), which wrote
+the original quirk. Every quirk change is in
+`custom_zha_quirks/sensor_ht_agl001.py`.
 
-## Fixes
+## 1.0.0-beta.1 (2026-11-12)
 
-### Thermostat mode frames too large to send
+The first release of the fork, based on upstream `c335919` (merge of PR #6,
+external temperature/humidity sensor support). Everything below is a
+difference from that version. The fork also adds an automated test suite
+(see [Tests](#tests)).
+
+This is a beta. Open problems, including state sometimes being lost after a
+restart, are listed under Known Issues in the [README](README.md#known-issues).
+
+### Fixes
+
+#### Thermostat mode frames too large to send
 
 Upstream sends W100 control frames to attribute `0xFFF2` with the high-level
 `write_attributes`. A size guard in that method rejects any single attribute
@@ -25,7 +34,7 @@ checks the response itself, whether it's a Write Attributes Response or a Defaul
 Response. If the device rejects a frame, the helper raises instead of treating
 the write as a success.
 
-### Thermostat Mode Switch not staying off
+#### Thermostat Mode Switch not staying off
 
 When the Thermostat Mode Switch was off, the device kept going back into
 thermostat mode, with the **T** symbol showing on the display. Testing on the
@@ -54,7 +63,7 @@ The fix:
 - The "thermostat on" and "thermostat off" frames are now built by their own
   methods, `_build_thermostat_on_frame` and `_build_thermostat_off_frame`.
 
-### Thermostat mode reset on every reconfigure
+#### Thermostat mode reset on every reconfigure
 
 Upstream's `apply_custom_configuration` always sent the "thermostat off" frame,
 then the "thermostat on" frame. The device was therefore put into thermostat mode
@@ -70,7 +79,7 @@ or when you press Reconfigure. It doesn't run on every HA startup. After a norma
 restart, the heartbeat reply described above is what puts the device back into
 the mode the user chose.
 
-### Turning thermostat mode on or off
+#### Turning thermostat mode on or off
 
 - `set_thermostat_mode` only updates the switch state (`0xFFF3`) and the
   climate entity once the device has accepted the frame. If the write fails it
@@ -83,7 +92,7 @@ the mode the user chose.
   matches what the reference quirk does; the delay gives the device time to
   process the "on" frame first.
 
-### HVAC state lost on restart
+#### HVAC state lost on restart
 
 Upstream kept the PMTSD values (`P`, `M`, `T`, `S`) in separate in-memory fields
 that went back to hard-coded defaults on every restart. The first heartbeat reply
@@ -102,7 +111,7 @@ These values are now worked out from the attributes zigpy saves:
 The device has a single target temperature, so writing either setpoint now
 updates both.
 
-### PMTSD protocol fixes
+#### PMTSD protocol fixes
 
 Hardware testing on 2026-11-12, together with the protocol analysis in
 [zigbee2mqtt #33469](https://github.com/Koenkk/zigbee2mqtt/issues/33469), turned
@@ -149,7 +158,7 @@ has the same problems.
   no way to carry it. Leaving `T` out of the reply instead was tried on
   hardware: it kept the half degree but left the device showing E02.
 
-### Climate entity shown as "unknown" after a restart
+#### Climate entity shown as "unknown" after a restart
 
 `W100ThermostatCluster` is a virtual cluster: the physical device has no standard
 Thermostat cluster. When ZHA read its attributes from the device, nothing came
@@ -160,13 +169,13 @@ default values the cluster sets up and restores only the values it has saved.
 cache-only read. Results come back under the same keys the caller used (name or
 ID).
 
-### Thermostat defaults to off
+#### Thermostat defaults to off
 
 Until the device reports its real state, the virtual thermostat assumes
 `system_mode=Off` (`P=1`). That way the quirk won't send PMTSD frames that turn
 on a device the user has switched off.
 
-### Setpoint change sensors
+#### Setpoint change sensors
 
 ZHA creates "Setpoint change source" and "Setpoint change source timestamp"
 diagnostic sensors for every thermostat. The W100's thermostat cluster is
@@ -176,7 +185,7 @@ empty. The quirk now fills them in whenever the setpoint actually changes:
 from Home Assistant, with the time of the change. Automations can use this to
 tell a change made on the device from one made by HA.
 
-### Fan entity
+#### Fan entity
 
 The device has no fan "off" (nor the On/Smart presets ZHA offers); these are
 sent as Auto (`S0`), and the entity keeps showing the value chosen in HA (see
@@ -187,7 +196,7 @@ Known Issues in the README).
   endpoint the quirk adds), so the read failed. Reads are now answered from
   the attribute cache, with Auto as the default, like the thermostat cluster.
 
-### External sensor mode
+#### External sensor mode
 
 Writing the tests turned up three bugs in the external temperature/humidity
 support added in upstream PR #6:
@@ -211,14 +220,14 @@ support added in upstream PR #6:
 Reads of these two attributes are also returned under the key the caller used
 (name or ID), as with the thermostat cluster, rather than always by ID.
 
-### Reporting configuration
+#### Reporting configuration
 
 The `configure_reporting` calls for the custom temperature (`0x0163`) and humidity
 (`0x016A`) attributes no longer pass `manufacturer=0x115F`. zigpy takes the
 manufacturer code from the attribute definitions, which are marked
 `is_manufacturer_specific=True`.
 
-## Internal cleanups
+### Internal cleanups
 
 - A single helper, `_find_w100_thermostat`, now looks up the thermostat cluster
   on endpoint 1. It replaces several copies that each checked slightly different
@@ -230,13 +239,13 @@ manufacturer code from the attribute definitions, which are marked
 - The "thermostat off" frame is padded with `ljust` instead of a length check
   that was always true.
 
-## Diagnostics
+### Diagnostics
 
 - Each PMTSD frame is logged at debug level when it is sent.
 - Each heartbeat is logged at debug level, along with the current thermostat
   feature state.
 
-## Tests
+### Tests
 
 Upstream has no tests. This fork adds a pytest suite in `tests/` that loads the
 quirk through ZHA's real device registry, with only the Zigbee radio mocked. It
