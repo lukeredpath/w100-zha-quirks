@@ -33,7 +33,7 @@ async def test_heartbeat_with_switch_off_reasserts_off_frame(w100):
 async def test_heartbeat_with_switch_on_replies_with_current_pmtsd(w100):
     w100.manu._update_attribute(0xFFF3, True)
     w100.thermostat.update_attribute(quirk.SYSTEM_MODE_ATTR, SystemMode.Heat)
-    w100.thermostat.set_setpoint(2150, from_ha=True)
+    w100.thermostat.set_setpoint(2150)
     w100.receive(HEARTBEAT)
     await w100.drain()
     assert w100.frames == ["P0_M1_T22_S0_D0"]
@@ -63,7 +63,7 @@ async def test_switch_on_sends_registration_then_active_pmtsd(w100):
     w100.thermostat._last_m = 1
     result = await w100.manu.write_attributes({"thermostat_mode_switch": True})
 
-    assert w100.frames == ["ON", "P0_M1_S0_D0"]
+    assert w100.frames == ["ON", "P0_M1_T20_S0_D0"]
     assert w100.manu.get(0xFFF3) is True
     assert w100.thermostat.get(quirk.SYSTEM_MODE_ATTR) == SystemMode.Heat
     assert result == [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS, attrid=0xFFF3)]]
@@ -166,9 +166,8 @@ async def test_control_frame_write_raises_on_rejection(w100, response):
         ((0, 1, 21.0, 2, 0), b"P0_M1_T21_S2_D0"),
         ((0, 1, 21.5, 2, 0), b"P0_M1_T22_S2_D0"),  # whole degrees, half up
         ((0, 1, 7, 2, 0), b"P0_M1_T7_S2_D0"),  # 14 chars: broke the old hardcoded lengths
-        ((0, 1, None, 2, 0), b"P0_M1_S2_D0"),
     ],
-    ids=["whole", "half-rounds-up", "single-digit", "without-T"],
+    ids=["whole", "half-rounds-up", "single-digit"],
 )
 async def test_pmtsd_frame_layout(w100, args, payload):
     await w100.manu.send_pmtsd(*args)
@@ -188,20 +187,7 @@ def test_pmtsd_length_fields_match_previous_hardcoded_values_for_15_chars():
     assert (body_len + 3, body_len) == (0x1F, 0x1C)
 
 
-# --- setpoint echo (device reports whole degrees) --------------------------------------
-
-
-async def test_device_reported_setpoint_is_not_echoed(w100):
-    """User sets 24.5 on the device; it reports T24. The heartbeat must not send T24."""
-    w100.manu._update_attribute(0xFFF3, True)
-    # The sequence seen on hardware: a full report, then a partial one.
-    w100.receive(pmtsd_frame("P0_M1_T23_S0"))
-    w100.receive(pmtsd_frame("M1_T24"))
-    w100.receive(HEARTBEAT)
-    await w100.drain()
-    assert w100.frames == ["P0_M1_S0_D0"]
-    # The reported value is still stored for HA to display.
-    assert w100.thermostat.get(quirk.HEATING_SETPOINT_ATTR) == 2400
+# --- setpoints and confirming local changes -------------------------------------------
 
 
 async def test_ha_set_setpoint_is_asserted(w100):
@@ -213,26 +199,6 @@ async def test_ha_set_setpoint_is_asserted(w100):
     assert w100.frames == ["P1_M0_T22_S0_D0"]
 
 
-async def test_device_report_after_ha_setpoint_stops_asserting_it(w100):
-    w100.manu._update_attribute(0xFFF3, True)
-    await w100.thermostat.write_attributes({"occupied_heating_setpoint": 2150})
-    w100.receive(pmtsd_frame("P0_M1_T23"))
-    w100.writes.clear()
-    w100.receive(HEARTBEAT)
-    await w100.drain()
-    assert w100.frames == ["P0_M1_S0_D0"]
-
-
-async def test_report_without_setpoint_keeps_ha_setpoint(w100):
-    w100.manu._update_attribute(0xFFF3, True)
-    await w100.thermostat.write_attributes({"occupied_heating_setpoint": 2150})
-    w100.receive(pmtsd_frame("P0_M1"))
-    w100.writes.clear()
-    w100.receive(HEARTBEAT)
-    await w100.drain()
-    assert w100.frames == ["P0_M1_T22_S0_D0"]
-
-
 async def test_ha_setpoint_uses_cooling_setpoint_in_cool_mode(w100):
     w100.manu._update_attribute(0xFFF3, True)
     await w100.thermostat.write_attributes({"system_mode": SystemMode.Cool, "occupied_cooling_setpoint": 2400})
@@ -242,11 +208,55 @@ async def test_ha_setpoint_uses_cooling_setpoint_in_cool_mode(w100):
     assert w100.frames == ["P0_M0_T24_S0_D0"]
 
 
+async def test_device_change_is_acknowledged_and_confirmed_with_full_state(w100):
+    """Without the state being sent back, the device shows E02 (seen on hardware)."""
+    w100.manu._update_attribute(0xFFF3, True)
+    w100.receive(pmtsd_frame("P0_M1_T23_S0", counter=0x06))
+    await w100.drain()
+    assert w100.acks == [0x06]
+    assert w100.frames == ["P0_M1_T23_S0_D0"]
+
+
+async def test_rapid_device_changes_are_confirmed_once_with_final_state(w100):
+    """The sequence seen on hardware: a full report, then a partial one."""
+    w100.manu._update_attribute(0xFFF3, True)
+    w100.receive(pmtsd_frame("P0_M1_T23_S0", counter=0x0A))
+    w100.receive(pmtsd_frame("M1_T24", counter=0x0B))
+    await w100.drain()
+    assert w100.acks == [0x0A, 0x0B]
+    assert w100.frames == ["P0_M1_T24_S0_D0"]
+
+
+async def test_confirmation_waits_for_changes_to_settle(w100, monkeypatch):
+    monkeypatch.setattr(quirk, "STATE_CONFIRMATION_DELAY", 0.05)
+    w100.manu._update_attribute(0xFFF3, True)
+    w100.receive(pmtsd_frame("P0_M1_T23_S0"))
+    await asyncio.sleep(0.01)
+    assert w100.frames == []
+    await w100.drain()
+    assert w100.frames == ["P0_M1_T23_S0_D0"]
+
+
+async def test_empty_device_frame_is_acknowledged_but_not_confirmed(w100):
+    """Empty payloads carry no readable state; echoing ours could undo the change."""
+    w100.manu._update_attribute(0xFFF3, True)
+    w100.receive(pmtsd_frame("", counter=0x08))
+    await w100.drain()
+    assert w100.acks == [0x08]
+    assert w100.frames == []
+
+
+async def test_device_change_not_confirmed_while_switch_off(w100):
+    """Sending PMTSD would keep the device in thermostat mode."""
+    w100.receive(pmtsd_frame("P0_M1_T23_S0"))
+    await w100.drain()
+    assert w100.frames == []
+
+
 # --- restart behaviour -----------------------------------------------------------------
 
 
-async def test_restart_with_switch_on_replies_with_persisted_state_without_setpoint(w100):
-    """After a restart the setpoint's source is unknown, so T is left out."""
+async def test_restart_with_switch_on_replies_with_persisted_state(w100):
     w100.restart({
         (1, 0xFCC0, 0xFFF3): True,
         (1, 0x0201, quirk.SYSTEM_MODE_ATTR): SystemMode.Heat,
@@ -256,7 +266,7 @@ async def test_restart_with_switch_on_replies_with_persisted_state_without_setpo
     })
     w100.receive(HEARTBEAT)
     await w100.drain()
-    assert w100.frames == ["P0_M1_S2_D0"]
+    assert w100.frames == ["P0_M1_T22_S2_D0"]
 
 
 async def test_restart_with_switch_off_reasserts_off(w100):
@@ -266,7 +276,7 @@ async def test_restart_with_switch_off_reasserts_off(w100):
     assert w100.frames == ["OFF"]
 
 
-async def test_restart_in_cool_mode(w100):
+async def test_restart_uses_cooling_setpoint_in_cool_mode(w100):
     w100.restart({
         (1, 0xFCC0, 0xFFF3): True,
         (1, 0x0201, quirk.SYSTEM_MODE_ATTR): SystemMode.Cool,
@@ -274,12 +284,12 @@ async def test_restart_in_cool_mode(w100):
     })
     w100.receive(HEARTBEAT)
     await w100.drain()
-    assert w100.frames == ["P0_M0_S0_D0"]
+    assert w100.frames == ["P0_M0_T24_S0_D0"]
 
 
 async def test_restart_with_nothing_persisted_uses_defaults(w100):
     w100.restart({(1, 0xFCC0, 0xFFF3): True})
-    assert w100.thermostat.pmtsd_state() == (1, 0, None, 0, 0)
+    assert w100.thermostat.pmtsd_state() == (1, 0, 20, 0, 0)
 
 
 # --- apply_custom_configuration --------------------------------------------------------
@@ -395,7 +405,7 @@ async def test_heartbeat_is_acknowledged_before_reply(w100):
     await w100.drain()
     assert w100.acks == [HEARTBEAT_COUNTER]
     assert w100.writes[0][3] == 0x24  # the ack goes first
-    assert w100.frames == ["P1_M0_S0_D0"]
+    assert w100.frames == ["P1_M0_T20_S0_D0"]
 
 
 async def test_heartbeat_with_switch_off_is_acknowledged(w100):
@@ -448,7 +458,7 @@ async def test_failed_ack_is_logged_not_raised(w100, caplog):
 async def test_frame_counter_increments_and_wraps(w100):
     w100.manu._frame_counter = 0xFE
     for _ in range(3):
-        await w100.manu.send_pmtsd(0, 1, None, 0, 0)
+        await w100.manu.send_pmtsd(0, 1, 20, 0, 0)
     assert [frame[4] for frame in w100.writes] == [0xFF, 0x00, 0x01]
     assert all(header_checksum_ok(frame) for frame in w100.writes)
 

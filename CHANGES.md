@@ -95,7 +95,7 @@ These values are now worked out from the attributes zigpy saves:
 | --- | --- |
 | `P` | `system_mode` (`Off` → `1`, otherwise `0`) |
 | `M` | `system_mode` (`Cool`/`Heat`/`Auto` → `0`/`1`/`2`). While off, the last active mode is used. |
-| `T` | the heating setpoint, or the cooling setpoint in `Cool` mode, in whole degrees. Only sent if HA set the setpoint itself; see [PMTSD protocol fixes](#pmtsd-protocol-fixes). |
+| `T` | the heating setpoint, or the cooling setpoint in `Cool` mode, in whole degrees (see [PMTSD protocol fixes](#pmtsd-protocol-fixes)) |
 | `S` | the fan cluster's `fan_mode` |
 | `D` | the last value the device reported, echoed back (its meaning is unknown; not saved, so `0` after a restart until the device reports it) |
 
@@ -133,13 +133,21 @@ has the same problems.
   the hub has been seen to cause **E01**. `T` is now always sent as a whole
   number. A setpoint written from HA is rounded (half up), and the rounded
   value is stored, so the climate entity shows what the device actually has.
-- **A setpoint reported by the device was echoed back.** Heartbeat replies sent
-  the last setpoint the device reported, which is rounded down to a whole
-  degree. That overwrote a half-degree setpoint the user had chosen on the
-  device itself. On hardware, 23.5 became 23.0 and 24.5 became 24.0. `T` is now
-  left out of the PMTSD frame (for example `P0_M1_S0_D0`) unless HA set the
-  setpoint itself. After a restart the source of the stored setpoint is
-  unknown, so `T` is left out until HA sets one.
+- **Changes made on the device were never confirmed.** An acknowledgement
+  isn't enough on its own. After a change on the device, the W100 waits for
+  the hub to send the state back as a PMTSD frame, and shows **E02** until it
+  does, which in practice meant until the next heartbeat (60–90 s later). Each
+  change that carries state is now acknowledged straight away and confirmed
+  with the full state once the changes stop: 1 s after the last one, so a
+  burst of button presses gets one confirmation. Frames with an empty payload
+  are only acknowledged: they carry no state we can read, and sending ours back
+  could undo the change. Nothing is sent back while the Thermostat Mode Switch
+  is off.
+
+  As a result, a half degree set on the device (for example 23.5) becomes the
+  whole degree the device reported (23) once it's confirmed. The protocol has
+  no way to carry it. Leaving `T` out of the reply instead was tried on
+  hardware: it kept the half degree but left the device showing E02.
 
 ### Climate entity shown as "unknown" after a restart
 

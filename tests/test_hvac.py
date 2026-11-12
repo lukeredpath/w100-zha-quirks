@@ -54,7 +54,7 @@ async def test_read_after_restart_reseeds_defaults(w100):
 
 async def test_system_mode_write_sends_pmtsd(w100):
     result = await w100.thermostat.write_attributes({"system_mode": SystemMode.Heat})
-    assert w100.frames == ["P0_M1_S0_D0"]
+    assert w100.frames == ["P0_M1_T20_S0_D0"]
     assert w100.thermostat._last_m == 1
     assert result == [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS, attrid=quirk.SYSTEM_MODE_ATTR)]]
 
@@ -112,7 +112,7 @@ async def test_write_without_manufacturer_cluster_does_not_send(w100):
 def test_running_state(w100, mode, local, setpoint, expected):
     t = w100.thermostat
     t.update_attribute(quirk.SYSTEM_MODE_ATTR, mode)
-    t.set_setpoint(setpoint, from_ha=True)
+    t.set_setpoint(setpoint)
     t.update_attribute(quirk.LOCAL_TEMPERATURE_ATTR, local)
     t.recalculate_running_state()
     assert t.get(quirk.RUNNING_STATE_ATTR) == expected
@@ -208,13 +208,13 @@ def test_fan_defaults(w100):
 async def test_fan_write_sends_s(w100, mode, s):
     result = await w100.fan.write_attributes({"fan_mode": mode})
     assert w100.fan.get(quirk.FAN_MODE_ATTR) == mode
-    assert w100.frames == [f"P1_M0_S{s}_D0"]
+    assert w100.frames == [f"P1_M0_T20_S{s}_D0"]
     assert result == [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS, attrid=0x0000)]]
 
 
 async def test_fan_write_by_id(w100):
     await w100.fan.write_attributes({0x0000: Fan.FanMode.High})
-    assert w100.frames == ["P1_M0_S3_D0"]
+    assert w100.frames == ["P1_M0_T20_S3_D0"]
 
 
 async def test_fan_write_without_manufacturer_cluster(w100):
@@ -252,7 +252,7 @@ async def test_device_report_updates_thermostat_and_fan(w100):
     assert t.get(quirk.HEATING_SETPOINT_ATTR) == 2250
     assert t.get(quirk.COOLING_SETPOINT_ATTR) == 2250
     assert w100.fan.get(quirk.FAN_MODE_ATTR) == Fan.FanMode.High
-    assert t.pmtsd_state() == (0, 1, None, 3, 1.0)
+    assert t.pmtsd_state() == (0, 1, 23, 3, 1.0)  # 22.5 -> whole degrees
 
 
 async def test_device_report_off_remembers_mode(w100):

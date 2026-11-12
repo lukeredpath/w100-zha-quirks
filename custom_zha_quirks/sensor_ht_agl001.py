@@ -69,6 +69,10 @@ BUTTON_NAMES = {
 # frame, giving the device time to process the registration first.
 REGISTRATION_SETTLE_DELAY = 0.5
 
+# How long to wait after the last local change on the device before sending
+# the state back to confirm it (debounces rapid button presses).
+STATE_CONFIRMATION_DELAY = 1.0
+
 # Thermostat attribute IDs
 LOCAL_TEMPERATURE_ATTR = Thermostat.AttributeDefs.local_temperature.id
 COOLING_SETPOINT_ATTR = Thermostat.AttributeDefs.occupied_cooling_setpoint.id
@@ -195,6 +199,9 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         self._background_tasks: set[asyncio.Task] = set()
         # Outgoing PMTSD frame counter; incremented per frame like the device's.
         self._frame_counter = random.randint(0, 255)
+        # Pending debounced confirmation of a local change (see
+        # _schedule_state_confirmation).
+        self._confirmation_task: Optional[asyncio.Task] = None
 
     @property
     def _cached_external_temperature(self) -> float:
@@ -241,7 +248,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         """
         return bool(self.get(self.AttributeDefs.thermostat_mode_switch.id))
 
-    def _spawn(self, coro, description: str) -> None:
+    def _spawn(self, coro, description: str) -> asyncio.Task:
         """Run a coroutine in the background, keeping a reference and logging failures."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
@@ -255,6 +262,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
                 _LOGGER.warning("W100: %s failed: %r", description, exc)
 
         task.add_done_callback(_done)
+        return task
 
     async def _write_w100_control_frame(self, payload: bytes) -> None:
         """Write a raw W100 control frame to attribute 0xFFF2.
@@ -672,6 +680,32 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         _LOGGER.debug("W100 payload: %s", payload_ascii)
         self._process_payload_updates(payload_ascii)
 
+        # A local change on the device is only settled once the hub sends the
+        # state back; until then the device shows E02 and may hold back further
+        # changes. Empty payloads carry no state we can read, so echoing our
+        # cached state for them could undo the change -- ack those only.
+        if device_counter is not None and payload_ascii:
+            self._schedule_state_confirmation()
+
+    def _schedule_state_confirmation(self) -> None:
+        """Send the state back once the device's changes have settled.
+
+        Debounced: each new local change restarts the wait, so pressing the
+        buttons several times produces a single confirmation reflecting the
+        final state rather than one per press.
+        """
+        if self._confirmation_task is not None:
+            self._confirmation_task.cancel()
+        self._confirmation_task = self._spawn(self._confirm_state(), "state confirmation")
+
+    async def _confirm_state(self) -> None:
+        await asyncio.sleep(STATE_CONFIRMATION_DELAY)
+        if not self._thermostat_feature_on:
+            # Sending PMTSD would keep the device in thermostat mode.
+            return
+        _LOGGER.debug("W100: Confirming device state change")
+        await self._send_cached_pmtsd()
+
     def _process_payload_updates(self, payload_ascii):
         """Process the parsed ASCII payload."""
         # Parse P_M_T_S_D format
@@ -710,7 +744,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             # back on restores it.
             thermostat._last_m = int(updates["M"])
         if "T" in updates:
-            thermostat.set_setpoint(updates["T"] * 100, from_ha=False)
+            thermostat.set_setpoint(updates["T"] * 100)
         if "D" in updates:
             thermostat._cached_d = updates["D"]
 
@@ -800,19 +834,10 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
     async def send_pmtsd(self, p, m, t_val, s, d):
         """Send PMTSD command.
 
-        Any field passed as None is left out of the frame (the device sends
-        partial PMTSD itself, e.g. "M1_T24"). This is used to omit T when the
-        only setpoint we know is one the device reported, since the device
-        rounds its reports to whole degrees.
-
         T is sent as whole degrees: the protocol only carries integers, and a
         decimal T (e.g. "T20.5") has been seen to cause E01 on the device.
         """
-        if t_val is not None:
-            t_val = whole_degrees(t_val)
-        # Format: P{P}_M{M}_T{T}_S{S}_D{D}
-        fields = (("P", p), ("M", m), ("T", t_val), ("S", s), ("D", d))
-        pmtsd_str = "_".join(f"{key}{value}" for key, value in fields if value is not None)
+        pmtsd_str = f"P{p}_M{m}_T{whole_degrees(t_val)}_S{s}_D{d}"
         _LOGGER.debug("W100: Sending PMTSD: %s", pmtsd_str)
         pmtsd_bytes = pmtsd_str.encode("ascii")
         pmtsd_len = len(pmtsd_bytes)
@@ -1067,10 +1092,6 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
         self._last_m = 0
         # PMTSD D value; its meaning is unknown, so it is just echoed back.
         self._cached_d = 0
-        # Whether the current setpoint was set by HA (exact) rather than learned
-        # from a device report (rounded to whole degrees). Not persisted: after
-        # a restart the source is unknown, so T is left out until HA sets one.
-        self._setpoint_from_ha = False
         super().__init__(*args, **kwargs)
         self._seed_defaults()
 
@@ -1098,14 +1119,9 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
         setpoint_attr = (
             COOLING_SETPOINT_ATTR if mode == Thermostat.SystemMode.Cool else HEATING_SETPOINT_ATTR
         )
-        # Only assert a setpoint HA set itself. One learned from a device report
-        # may be rounded (the device reports whole degrees), and sending it back
-        # would overwrite a half-degree setpoint the user chose on the device.
-        t_val = (
-            self.get(setpoint_attr, self._DEFAULT_SETPOINT) / 100.0
-            if self._setpoint_from_ha
-            else None
-        )
+        # Whole degrees: that's all the Zigbee PMTSD protocol carries. A
+        # half-degree set on the device is reported (and so confirmed) rounded.
+        t_val = whole_degrees(self.get(setpoint_attr, self._DEFAULT_SETPOINT) / 100.0)
 
         s = 0
         ep21 = self.endpoint.device.endpoints.get(21)
@@ -1115,13 +1131,8 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
 
         return p, m, t_val, s, self._cached_d
 
-    def set_setpoint(self, value, *, from_ha: bool):
-        """Set both setpoints; the W100 has a single target temperature (T).
-
-        from_ha records whether the value is exact (set by HA) or came from a
-        device report (possibly rounded); see pmtsd_state.
-        """
-        self._setpoint_from_ha = from_ha
+    def set_setpoint(self, value):
+        """Set both setpoints; the W100 has a single target temperature (T)."""
         self.update_attribute(HEATING_SETPOINT_ATTR, value)
         self.update_attribute(COOLING_SETPOINT_ATTR, value)
 
@@ -1188,7 +1199,7 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
                 # Single target temperature on the device: keep both in step.
                 # The protocol only carries whole degrees, so store what the
                 # device will actually use and HA shows the real setpoint.
-                self.set_setpoint(whole_degrees(value / 100) * 100, from_ha=True)
+                self.set_setpoint(whole_degrees(value / 100) * 100)
             else:
                 # system_mode writes also update _last_m via _update_attribute.
                 self._update_attribute(attr_id, value)

@@ -152,3 +152,9 @@ def no_settle_delay(monkeypatch):
 @pytest.fixture
 def w100() -> W100:
     return build_w100()
+
+
+@pytest.fixture(autouse=True)
+def no_confirmation_delay(monkeypatch):
+    """Skip the state-confirmation debounce unless a test opts back in."""
+    monkeypatch.setattr(quirk, "STATE_CONFIRMATION_DELAY", 0)
