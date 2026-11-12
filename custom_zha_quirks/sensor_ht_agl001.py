@@ -64,6 +64,45 @@ BUTTON_NAMES = {
     3: MINUS_BUTTON,
 }
 
+# Delay between the thermostat registration frame and the follow-up PMTSD
+# frame, giving the device time to process the registration first.
+REGISTRATION_SETTLE_DELAY = 0.5
+
+# Thermostat attribute IDs
+LOCAL_TEMPERATURE_ATTR = Thermostat.AttributeDefs.local_temperature.id
+COOLING_SETPOINT_ATTR = Thermostat.AttributeDefs.occupied_cooling_setpoint.id
+HEATING_SETPOINT_ATTR = Thermostat.AttributeDefs.occupied_heating_setpoint.id
+SYSTEM_MODE_ATTR = Thermostat.AttributeDefs.system_mode.id
+RUNNING_STATE_ATTR = Thermostat.AttributeDefs.running_state.id
+FAN_MODE_ATTR = Fan.AttributeDefs.fan_mode.id
+
+# PMTSD M value <-> system_mode
+M_TO_SYSTEM_MODE = {
+    0: Thermostat.SystemMode.Cool,
+    1: Thermostat.SystemMode.Heat,
+    2: Thermostat.SystemMode.Auto,
+}
+SYSTEM_MODE_TO_M = {mode: m for m, mode in M_TO_SYSTEM_MODE.items()}
+
+# PMTSD S value <-> fan_mode (anything else is S=0 / Auto)
+S_TO_FAN_MODE = {
+    1: Fan.FanMode.Low,
+    2: Fan.FanMode.Medium,
+    3: Fan.FanMode.High,
+}
+FAN_MODE_TO_S = {mode: s for s, mode in S_TO_FAN_MODE.items()}
+
+
+def _find_w100_thermostat(device) -> Optional["W100ThermostatCluster"]:
+    """Return the virtual W100 thermostat cluster on endpoint 1, if present."""
+    ep1 = device.endpoints.get(1)
+    if ep1 is None:
+        return None
+    thermostat = ep1.in_clusters.get(Thermostat.cluster_id)
+    if isinstance(thermostat, W100ThermostatCluster):
+        return thermostat
+    return None
+
 
 class MultistateInputCluster(CustomCluster, MultistateInput):
     """MultistateInput cluster that emits zha_event with button and press type."""
@@ -147,11 +186,9 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         super().__init__(*args, **kwargs)
         self._cached_external_temperature = self._DEFAULT_EXTERNAL_TEMPERATURE
         self._cached_external_humidity = self._DEFAULT_EXTERNAL_HUMIDITY
-        # Tracks the thermostat *feature* (Thermostat Mode Switch / T symbol),
-        # set by set_thermostat_mode. Drives the switch-aware heartbeat reply.
-        # Default off (buttons-only); re-asserted on init from the persisted
-        # 0xFFF3 value.
-        self._thermostat_feature_on = False
+        # Strong references to fire-and-forget tasks so they aren't GC'd
+        # before completion.
+        self._background_tasks: set[asyncio.Task] = set()
         # Initialize the attribute cache with default values
         self._update_attribute(self.AttributeDefs.external_temperature.id, self._cached_external_temperature)
         self._update_attribute(self.AttributeDefs.external_humidity.id, self._cached_external_humidity)
@@ -175,6 +212,32 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         # Keep consistent with how this quirk already builds W100 frames.
         return self.endpoint.device.ieee.serialize()
 
+    @property
+    def _thermostat_feature_on(self) -> bool:
+        """Whether the thermostat *feature* (Thermostat Mode Switch) is on.
+
+        Derived from the 0xFFF3 attribute rather than held separately: zigpy
+        persists the attribute cache and restores it on startup, whereas
+        apply_custom_configuration only runs on pair/rejoin/reconfigure. A
+        separate in-memory flag would reset to off on every HA restart.
+        """
+        return bool(self.get(self.AttributeDefs.thermostat_mode_switch.id))
+
+    def _spawn(self, coro, description: str) -> None:
+        """Run a coroutine in the background, keeping a reference and logging failures."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                _LOGGER.warning("W100: %s failed: %r", description, exc)
+
+        task.add_done_callback(_done)
+
     async def _write_w100_control_frame(self, payload: bytes) -> None:
         """Write a raw W100 control frame to attribute 0xFFF2.
 
@@ -182,6 +245,9 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         size guard, which rejects a single attribute record larger than the
         link's per-request limit (~50 bytes) -- e.g. the ~60-byte
         thermostat-mode registration frame.
+
+        Raises if the device reports a non-SUCCESS status, since
+        write_attributes_raw does no status checking of its own.
         """
         attr = foundation.Attribute(
             attrid=t.uint16_t(W100_ATTR),
@@ -190,7 +256,21 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
                 value=t.LVBytes(bytes(payload)),
             ),
         )
-        await self.write_attributes_raw([attr], manufacturer_code=0x115F)
+        result = await self.write_attributes_raw([attr], manufacturer_code=0x115F)
+
+        # Either a Write Attributes Response (status_records) or a Default
+        # Response (status). Older zigpy returned [records] as a plain list.
+        records = getattr(result, "status_records", None)
+        if records is None and isinstance(result, (list, tuple)) and result:
+            records = result[0]
+        if records is not None:
+            failures = [r.status for r in records if r.status != foundation.Status.SUCCESS]
+        else:
+            status = getattr(result, "status", foundation.Status.SUCCESS)
+            failures = [] if status == foundation.Status.SUCCESS else [status]
+
+        if failures:
+            raise RuntimeError(f"W100 control frame write rejected: {failures}")
 
     async def _set_external_sensor_mode(self, mode: Any) -> None:
         normalized = self._normalize_sensor_mode(mode)
@@ -371,9 +451,10 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         if "thermostat_mode_switch" in attributes or 0xFFF3 in attributes:
             val = attributes.get("thermostat_mode_switch", attributes.get(0xFFF3))
             mode = "ON" if val else "OFF"
+            # set_thermostat_mode updates 0xFFF3 itself, only once the frame
+            # has been accepted; if it raises, the switch keeps its old state.
             await self.set_thermostat_mode(mode)
-            self._update_attribute(0xFFF3, val)
-            
+
             records = [
                 foundation.WriteAttributesStatusRecord(
                     foundation.Status.SUCCESS,
@@ -549,7 +630,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
                      "(feature_on=%s).",
                      self._thermostat_feature_on,
                  )
-                 asyncio.create_task(self._reply_to_heartbeat())
+                 self._spawn(self._reply_to_heartbeat(), "heartbeat reply")
             return
 
         payload_len = data[idx + 2]
@@ -581,45 +662,35 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
                 continue
 
         # Update Thermostat on Endpoint 1
-        ep1 = self.endpoint.device.endpoints.get(1)
-        if not ep1:
+        thermostat = _find_w100_thermostat(self.endpoint.device)
+        if thermostat is None:
             return
-            
-        thermostat = ep1.out_clusters.get(Thermostat.cluster_id) or ep1.in_clusters.get(Thermostat.cluster_id)
 
-        if thermostat and isinstance(thermostat, W100ThermostatCluster):
-            self._update_thermostat_cache(thermostat, updates)
-            
-            # Update Fan on Endpoint 21
-            if "S" in updates:
-                self._update_fan_cluster(int(updates["S"]))
+        self._update_thermostat_cache(thermostat, updates)
 
-            # Update System Mode
-            self._update_system_mode(thermostat, updates)
+        # Update Fan on Endpoint 21
+        if "S" in updates:
+            self._update_fan_cluster(int(updates["S"]))
+
+        # Update System Mode
+        self._update_system_mode(thermostat, updates)
 
     def _update_thermostat_cache(self, thermostat, updates):
-        """Update thermostat cached values."""
-        if "P" in updates:
-            thermostat._cached_p = int(updates["P"])
+        """Update thermostat state from a device-reported PMTSD payload.
+
+        P and S are applied via system_mode and the fan cluster respectively
+        (see _update_system_mode / _update_fan_cluster); the PMTSD values sent
+        back to the device are derived from those attributes.
+        """
         if "M" in updates:
-            thermostat._cached_m = int(updates["M"])
+            # Remember the HVAC mode even while powered off (P=1), so turning
+            # back on restores it.
+            thermostat._last_m = int(updates["M"])
         if "T" in updates:
-            thermostat._cached_t = updates["T"]
-            # Update setpoints
-            val = updates["T"] * 100
-            thermostat.update_attribute(
-                Thermostat.attributes_by_name["occupied_heating_setpoint"].id,
-                val,
-            )
-            thermostat.update_attribute(
-                Thermostat.attributes_by_name["occupied_cooling_setpoint"].id,
-                val,
-            )
-        if "S" in updates:
-            thermostat._cached_s = int(updates["S"])
+            thermostat.set_setpoint(updates["T"] * 100)
         if "D" in updates:
             thermostat._cached_d = updates["D"]
-            
+
         thermostat.recalculate_running_state()
 
     def _update_fan_cluster(self, s_value):
@@ -628,48 +699,30 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         if ep21:
             fan = ep21.in_clusters.get(Fan.cluster_id)
             if fan:
-                mode = Fan.FanMode.Auto
-                if s_value == 1:
-                    mode = Fan.FanMode.Low
-                elif s_value == 2:
-                    mode = Fan.FanMode.Medium
-                elif s_value == 3:
-                    mode = Fan.FanMode.High
-                
+                mode = S_TO_FAN_MODE.get(s_value, Fan.FanMode.Auto)
                 _LOGGER.debug("W100: Updating fan mode to %s (S=%s)", mode, s_value)
-                fan.update_attribute(0x0000, mode)
+                fan.update_attribute(FAN_MODE_ATTR, mode)
 
     def _update_system_mode(self, thermostat, updates):
         """Update system mode based on P and M values."""
-        p = thermostat._cached_p
-        m = thermostat._cached_m
-        
+        p, m, *_ = thermostat.pmtsd_state()
+
         # Override with updates if present
         if "P" in updates:
             p = int(updates["P"])
         if "M" in updates:
             m = int(updates["M"])
-        
+
         _LOGGER.debug("W100: Syncing system_mode with P=%s, M=%s", p, m)
-            
-        if p is not None and m is not None:
-            if p == 1:
-                mode = Thermostat.SystemMode.Off
-            elif m == 0:
-                mode = Thermostat.SystemMode.Cool
-            elif m == 1:
-                mode = Thermostat.SystemMode.Heat
-            elif m == 2:
-                mode = Thermostat.SystemMode.Auto
-            else:
-                mode = Thermostat.SystemMode.Off
-            
-            _LOGGER.debug("W100: Updating system_mode to %s", mode)
-            thermostat.update_attribute(
-                Thermostat.attributes_by_name["system_mode"].id,
-                mode
-            )
-            thermostat.recalculate_running_state()
+
+        if p == 1:
+            mode = Thermostat.SystemMode.Off
+        else:
+            mode = M_TO_SYSTEM_MODE.get(m, Thermostat.SystemMode.Off)
+
+        _LOGGER.debug("W100: Updating system_mode to %s", mode)
+        thermostat.update_attribute(SYSTEM_MODE_ATTR, mode)
+        thermostat.recalculate_running_state()
 
     async def _reply_to_heartbeat(self):
         """Reply to the device's PMTSD heartbeat/request, switch-aware.
@@ -691,22 +744,14 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             await self._send_cached_pmtsd()
 
     async def _send_cached_pmtsd(self):
-        """Send the cached PMTSD frame (current HVAC state) to the device.
+        """Send the current HVAC state to the device as a PMTSD frame.
 
-        _cached_p is pinned by set_thermostat_mode (1=off, 0=active), by the
-        Thermostat entity's system_mode writes, and seeded to 1 (off).
+        The values are derived from the thermostat/fan attributes (which zigpy
+        persists across restarts), not from separate in-memory fields.
         """
-        ep1 = self.endpoint.device.endpoints.get(1)
-        if ep1:
-            thermostat = ep1.in_clusters.get(Thermostat.cluster_id)
-            if thermostat and hasattr(thermostat, "_cached_p"):
-                 await self.send_pmtsd(
-                    thermostat._cached_p,
-                    thermostat._cached_m,
-                    thermostat._cached_t,
-                    thermostat._cached_s,
-                    thermostat._cached_d
-                )
+        thermostat = _find_w100_thermostat(self.endpoint.device)
+        if thermostat is not None:
+            await self.send_pmtsd(*thermostat.pmtsd_state())
 
     async def send_pmtsd(self, p, m, t_val, s, d):
         """Send PMTSD command."""
@@ -743,7 +788,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         heartbeat while the feature is off, since buttons-only mode cannot be
         expressed as a PMTSD value.
         """
-        dev_mac = self.endpoint.device.ieee.serialize()
+        dev_mac = self._device_ieee_bytes()
         prefix = bytes.fromhex("aa711c44691c0441196891")
         frame_id = bytes([random.randint(0, 255)])
         seq = bytes([random.randint(0, 255)])
@@ -754,50 +799,57 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             frame += b"\x00" * (34 - len(frame))
         return frame
 
+    def _build_thermostat_on_frame(self) -> bytes:
+        """Build the thermostat-feature registration ("ON") frame (~60 bytes)."""
+        dev_mac = self._device_ieee_bytes()
+        hub_mac = bytes.fromhex("54ef4480711a")
+
+        prefix = bytes.fromhex("aa713244")
+        message_alea = bytes([random.randint(0, 255), random.randint(0, 255)])
+        zigbee_header = bytes.fromhex("02412f6891")
+        message_id = bytes([random.randint(0, 255), random.randint(0, 255)])
+        control = b"\x18"
+
+        payload_macs = dev_mac + b"\x00\x00" + hub_mac
+        payload_tail = bytes.fromhex("08000844150a0109e7a9bae8b083e58a9f000000000001012a40")
+
+        return prefix + message_alea + zigbee_header + message_id + control + payload_macs + payload_tail
+
     async def set_thermostat_mode(self, mode: str):
         """Set thermostat mode (ON/OFF).
 
         This toggles the thermostat *feature* (the Thermostat Mode Switch / the
-        T symbol) via the explicit registration/unregister frames, which is
-        distinct from the HVAC system_mode set via the Thermostat entity.
+        T symbol) via the explicit registration/unregister frames.
+
+        State (0xFFF3 and the climate entity's system_mode) is only updated
+        once the device has accepted the frame; if the write fails this raises
+        and nothing changes.
         """
-        self._thermostat_feature_on = mode == "ON"
-
-        # Keep the PMTSD power flag roughly in sync with the climate entity
-        # (P=1 off / P=0 active). Note this is the HVAC layer, not the feature.
-        ep1 = self.endpoint.device.endpoints.get(1)
-        if ep1:
-            thermostat = ep1.in_clusters.get(Thermostat.cluster_id)
-            if thermostat and isinstance(thermostat, W100ThermostatCluster):
-                thermostat._cached_p = 1 if mode == "OFF" else 0
-
-        if mode == "ON":
-            device_ieee = self.endpoint.device.ieee
-            dev_mac = device_ieee.serialize()
-            hub_mac = bytes.fromhex("54ef4480711a")
-
-            prefix = bytes.fromhex("aa713244")
-            message_alea = bytes([random.randint(0, 255), random.randint(0, 255)])
-            zigbee_header = bytes.fromhex("02412f6891")
-            message_id = bytes([random.randint(0, 255), random.randint(0, 255)])
-            control = b"\x18"
-
-            payload_macs = dev_mac + b"\x00\x00" + hub_mac
-            payload_tail = bytes.fromhex("08000844150a0109e7a9bae8b083e58a9f000000000001012a40")
-
-            frame = prefix + message_alea + zigbee_header + message_id + control + payload_macs + payload_tail
-        else:
-            frame = self._build_thermostat_off_frame()
+        turning_on = mode == "ON"
+        frame = (
+            self._build_thermostat_on_frame()
+            if turning_on
+            else self._build_thermostat_off_frame()
+        )
 
         # Send via the raw helper so the ~60-byte ON registration frame isn't
         # rejected by the high-level write_attributes size guard.
         await self._write_w100_control_frame(frame)
 
-        if mode == "ON":
+        self._update_attribute(self.AttributeDefs.thermostat_mode_switch.id, turning_on)
+
+        # Keep the climate entity in step with the feature: off -> Off,
+        # on -> the last-known active HVAC mode.
+        thermostat = _find_w100_thermostat(self.endpoint.device)
+        if thermostat is not None:
+            thermostat.set_active(turning_on)
+
+        if turning_on:
             # The registration frame enables the device-side thermostat
             # feature; follow it with the PMTSD active frame (P=0) to set the
-            # actual running state, mirroring the reference quirk. _cached_p was
-            # set to 0 above, so _send_cached_pmtsd will send it.
+            # actual running state, mirroring the reference quirk. Give the
+            # device a moment to process the registration first.
+            await asyncio.sleep(REGISTRATION_SETTLE_DELAY)
             await self._send_cached_pmtsd()
 
     async def apply_custom_configuration(self, *args, **kwargs):
@@ -834,14 +886,14 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         except Exception as e:
             _LOGGER.warning("W100: Failed to bind manufacturer cluster: %s", e)
 
-        # Re-assert the last-known thermostat-mode-switch state. The device
-        # reverts to its firmware default (thermostat ON) whenever it reconnects
-        # -- e.g. during an HA/ZHA restart, when its heartbeats go unanswered --
-        # so buttons-only mode has to be re-applied on startup. Re-send the
-        # frame matching the user's last choice (the persisted 0xFFF3 value);
-        # default to OFF/buttons-only when it's unknown, consistent with the
-        # system_mode=Off / _cached_p=1 seeds. This re-applies the user's own
-        # choice, so (unlike a hardcoded mode) it doesn't fight reconfigures.
+        # Re-assert the last-known thermostat-mode-switch state. This only runs
+        # on pair/rejoin/reconfigure, not on every HA startup; after a plain
+        # restart the switch-aware heartbeat reply (driven by the persisted
+        # 0xFFF3 value) is what brings the device back into line. Re-send the
+        # frame matching the user's last choice; default to OFF/buttons-only
+        # when it's unknown, consistent with the system_mode=Off seed. This
+        # re-applies the user's own choice, so (unlike a hardcoded mode) it
+        # doesn't fight reconfigures.
         try:
             last_switch = self.get(0xFFF3)
             mode = "ON" if last_switch else "OFF"
@@ -912,41 +964,21 @@ class W100FanCluster(CustomCluster, Fan):
         """Intercept write attributes."""
         if "fan_mode" in attributes or 0x0000 in attributes:
             val = attributes.get("fan_mode", attributes.get(0x0000))
-            
-            # Map FanMode to W100 S
-            # Auto(5) -> 0
-            # Low(1) -> 1
-            # Medium(2) -> 2
-            # High(3) -> 3
-            s = 0
-            if val == Fan.FanMode.Low:
-                s = 1
-            elif val == Fan.FanMode.Medium:
-                s = 2
-            elif val == Fan.FanMode.High:
-                s = 3
-            
-            _LOGGER.debug("W100FanCluster: Writing fan_mode %s -> S=%s", val, s)
-            
-            # Update Thermostat cache and send
+            _LOGGER.debug(
+                "W100FanCluster: Writing fan_mode %s -> S=%s",
+                val,
+                FAN_MODE_TO_S.get(val, 0),
+            )
+
+            # The PMTSD S value is derived from this attribute, so update it
+            # first and then send the current state.
+            self._update_attribute(FAN_MODE_ATTR, val)
+
             ep1 = self.endpoint.device.endpoints.get(1)
-            if ep1:
-                thermostat = ep1.in_clusters.get(Thermostat.cluster_id)
-                if thermostat and isinstance(thermostat, W100ThermostatCluster):
-                    thermostat._cached_s = s
-                    
-                    manu_cluster = ep1.in_clusters.get(W100ManuSpecificCluster.cluster_id)
-                    if manu_cluster:
-                        await manu_cluster.send_pmtsd(
-                            thermostat._cached_p,
-                            thermostat._cached_m,
-                            thermostat._cached_t,
-                            s,
-                            thermostat._cached_d
-                        )
-            
-            self._update_attribute(0x0000, val)
-            
+            manu_cluster = ep1.in_clusters.get(W100ManuSpecificCluster.cluster_id) if ep1 else None
+            if isinstance(manu_cluster, W100ManuSpecificCluster):
+                await manu_cluster._send_cached_pmtsd()
+
             records = [
                 foundation.WriteAttributesStatusRecord(
                     foundation.Status.SUCCESS,
@@ -965,62 +997,105 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
         Thermostat.attributes_by_name["ctrl_sequence_of_oper"].id: Thermostat.ControlSequenceOfOperation.Cooling_and_Heating,
     }
 
+    # Seed values for the virtual attributes. Default to off (P=1): until the
+    # device reports its real state via a PMTSD data frame, an off default
+    # avoids re-enabling a device the user has turned off.
+    _DEFAULT_SETPOINT = 2000
+    _DEFAULT_ATTRIBUTES = {
+        RUNNING_STATE_ATTR: 0,  # Idle
+        SYSTEM_MODE_ATTR: Thermostat.SystemMode.Off,
+        HEATING_SETPOINT_ATTR: _DEFAULT_SETPOINT,
+        COOLING_SETPOINT_ATTR: _DEFAULT_SETPOINT,
+    }
+
     def __init__(self, *args, **kwargs):
         """Initialize the cluster."""
-        super().__init__(*args, **kwargs)
-        # Default to off (P=1), consistent with the system_mode=Off seed below.
-        # Until the device reports its real state via a PMTSD data frame, an
-        # off default keeps heartbeat replays suppressed instead of re-enabling
-        # a device the user has turned off.
-        self._cached_p = 1
-        self._cached_m = 0
-        self._cached_t = 20.0
-        self._cached_s = 0
+        # Last active HVAC mode as a PMTSD M value, so turning the thermostat
+        # back on restores it. Set before super().__init__ since that can
+        # route through _update_attribute.
+        self._last_m = 0
+        # PMTSD D value; its meaning is unknown, so it is just echoed back.
         self._cached_d = 0
-        
-        # Initialize attributes
-        self._update_attribute(0x0029, 0)  # running_state = Idle
-        self._update_attribute(0x001C, Thermostat.SystemMode.Off)
-        self._update_attribute(0x0012, 2000)
-        self._update_attribute(0x0011, 2000)
+        super().__init__(*args, **kwargs)
+        self._seed_defaults()
 
-    async def read_attributes(
-        self, attributes, allow_cache=False, only_cache=False, manufacturer=None
-    ):
+    def _seed_defaults(self):
+        """Fill in any virtual attributes missing from the cache.
+
+        On startup zigpy clears the cache built during __init__ and restores
+        only what was persisted, so the seeds can be missing afterwards.
+        """
+        for attr_id, default in self._DEFAULT_ATTRIBUTES.items():
+            if self.get(attr_id) is None:
+                self._update_attribute(attr_id, default)
+
+    def _update_attribute(self, attrid, value):
+        super()._update_attribute(attrid, value)
+        if getattr(attrid, "id", attrid) == SYSTEM_MODE_ATTR and value in SYSTEM_MODE_TO_M:
+            self._last_m = SYSTEM_MODE_TO_M[value]
+
+    def pmtsd_state(self) -> tuple:
+        """Current (P, M, T, S, D) values derived from the persisted attributes."""
+        mode = self.get(SYSTEM_MODE_ATTR, Thermostat.SystemMode.Off)
+        p = 1 if mode == Thermostat.SystemMode.Off else 0
+        m = SYSTEM_MODE_TO_M.get(mode, self._last_m)
+
+        setpoint_attr = (
+            COOLING_SETPOINT_ATTR if mode == Thermostat.SystemMode.Cool else HEATING_SETPOINT_ATTR
+        )
+        t_val = self.get(setpoint_attr, self._DEFAULT_SETPOINT) / 100.0
+
+        s = 0
+        ep21 = self.endpoint.device.endpoints.get(21)
+        fan = ep21.in_clusters.get(Fan.cluster_id) if ep21 else None
+        if fan is not None:
+            s = FAN_MODE_TO_S.get(fan.get(FAN_MODE_ATTR), 0)
+
+        return p, m, t_val, s, self._cached_d
+
+    def set_setpoint(self, value):
+        """Set both setpoints; the W100 has a single target temperature (T)."""
+        self.update_attribute(HEATING_SETPOINT_ATTR, value)
+        self.update_attribute(COOLING_SETPOINT_ATTR, value)
+
+    def set_active(self, active: bool):
+        """Set system_mode to Off, or to the last-known active HVAC mode."""
+        mode = (
+            M_TO_SYSTEM_MODE.get(self._last_m, Thermostat.SystemMode.Cool)
+            if active
+            else Thermostat.SystemMode.Off
+        )
+        self.update_attribute(SYSTEM_MODE_ATTR, mode)
+        self.recalculate_running_state()
+
+    async def read_attributes(self, attributes, allow_cache=False, only_cache=False, *args, **kwargs):
         """Serve thermostat attributes from the local cache.
 
         This is a virtual cluster -- the physical device has no standard
         Thermostat cluster, so reading it from the device returns nothing and
         leaves the climate entity 'unknown' (e.g. after a restart). Serve the
-        seeded/synced cache instead of querying the device.
+        cache instead of querying the device, via zigpy's own cache-only read
+        so results are keyed the way the caller asked for them.
         """
-        success = {}
-        failure = {}
-        for attr in attributes:
-            attr_id = attr if isinstance(attr, int) else self.attributes_by_name[attr].id
-            value = self.get(attr_id)
-            if value is not None:
-                success[attr_id] = value
-            else:
-                failure[attr_id] = foundation.Status.UNSUPPORTED_ATTRIBUTE
-        return success, failure
+        self._seed_defaults()
+        return await super().read_attributes(attributes, True, True, *args, **kwargs)
 
     def recalculate_running_state(self):
         """Recalculate running state based on temp and setpoint."""
-        local_temp = self.get(0x0000)
-        mode = self.get(0x001C)
-        
+        local_temp = self.get(LOCAL_TEMPERATURE_ATTR)
+        mode = self.get(SYSTEM_MODE_ATTR)
+
         if mode == Thermostat.SystemMode.Cool:
-            setpoint = self.get(0x0011)
+            setpoint = self.get(COOLING_SETPOINT_ATTR)
         else:
-            setpoint = self.get(0x0012)
+            setpoint = self.get(HEATING_SETPOINT_ATTR)
 
         if local_temp is None:
             temp_cluster = self.endpoint.in_clusters.get(TemperatureMeasurement.cluster_id)
             if temp_cluster:
                 local_temp = temp_cluster.get(0x0000)
                 if local_temp is not None:
-                    self.update_attribute(0x0000, local_temp)
+                    self.update_attribute(LOCAL_TEMPERATURE_ATTR, local_temp)
 
         if local_temp is None or setpoint is None or mode is None:
             return
@@ -1033,7 +1108,7 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
             if local_temp > setpoint:
                 state = 0x0002 # Cool State On
         
-        self.update_attribute(0x0029, state)
+        self.update_attribute(RUNNING_STATE_ATTR, state)
 
     async def write_attributes(self, attributes, manufacturer=None):
         """Intercept write attributes."""
@@ -1042,36 +1117,18 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
             if isinstance(attr, str):
                 attr_id = self.attributes_by_name[attr].id
 
-            # Update internal cache from write
-            if attr in ("occupied_heating_setpoint", "occupied_cooling_setpoint") or attr_id in (0x0012, 0x0011):
-                self._cached_t = value / 100.0
-            
-            if attr == "system_mode" or attr_id == 0x001C:
-                mode = value
-                if mode == Thermostat.SystemMode.Off:
-                    self._cached_p = 1
-                else:
-                    self._cached_p = 0
-                    if mode == Thermostat.SystemMode.Cool:
-                        self._cached_m = 0
-                    elif mode == Thermostat.SystemMode.Heat:
-                        self._cached_m = 1
-                    elif mode == Thermostat.SystemMode.Auto:
-                        self._cached_m = 2
-            
-            self._update_attribute(attr_id, value)
+            if attr_id in (HEATING_SETPOINT_ATTR, COOLING_SETPOINT_ATTR):
+                # Single target temperature on the device: keep both in step.
+                self.set_setpoint(value)
+            else:
+                # system_mode writes also update _last_m via _update_attribute.
+                self._update_attribute(attr_id, value)
 
-        # Send update
-        manu_cluster = self.endpoint.in_clusters.get(0xFCC0)
-        if manu_cluster and isinstance(manu_cluster, W100ManuSpecificCluster):
-            await manu_cluster.send_pmtsd(
-                self._cached_p,
-                self._cached_m,
-                self._cached_t,
-                self._cached_s,
-                self._cached_d
-            )
-        
+        # Send update; PMTSD is derived from the attributes just written.
+        manu_cluster = self.endpoint.in_clusters.get(W100ManuSpecificCluster.cluster_id)
+        if isinstance(manu_cluster, W100ManuSpecificCluster):
+            await manu_cluster._send_cached_pmtsd()
+
         records = [
             foundation.WriteAttributesStatusRecord(
                 foundation.Status.SUCCESS,
