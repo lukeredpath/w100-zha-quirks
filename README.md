@@ -5,6 +5,7 @@ This custom quirk enables functionality for the Aqara W100 Climate Sensor in Hom
 ## Features
 
 - **Thermostat Control:** Climate entity with Heat, Cool, Auto (shown in Home Assistant as Heat/Cool) and Off modes, and a target temperature. Requires the Thermostat Mode Switch to be on.
+- **Setpoint change tracking:** The "Setpoint change source" and "Setpoint change source timestamp" diagnostic sensors show whether the last setpoint change was made on the device (Manual) or from Home Assistant (External), and when.
 - **Fan Control:** Dedicated Fan entity (Endpoint 21) supporting Low, Medium, High, and Auto speeds.
 - **Sensors:** Temperature, Humidity, and Battery reporting.
 - **External sensor display:** Show readings from another source on the device (for example outdoor weather):

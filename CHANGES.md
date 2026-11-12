@@ -166,6 +166,16 @@ Until the device reports its real state, the virtual thermostat assumes
 `system_mode=Off` (`P=1`). That way the quirk won't send PMTSD frames that turn
 on a device the user has switched off.
 
+### Setpoint change sensors
+
+ZHA creates "Setpoint change source" and "Setpoint change source timestamp"
+diagnostic sensors for every thermostat. The W100's thermostat cluster is
+virtual, so nothing ever set the attributes behind them and they stayed
+empty. The quirk now fills them in whenever the setpoint actually changes:
+**Manual** when it was changed on the device, **External** when it was changed
+from Home Assistant, with the time of the change. Automations can use this to
+tell a change made on the device from one made by HA.
+
 ### Fan entity
 
 - **Off showed as off in HA but AUTO on the device.** The device has no fan

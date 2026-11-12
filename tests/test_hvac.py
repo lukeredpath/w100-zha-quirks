@@ -1,4 +1,5 @@
 """Virtual thermostat and fan clusters, and device-reported PMTSD frames."""
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -347,3 +348,58 @@ async def test_unparseable_control_data_is_ignored(w100, data):
     await w100.drain()
     assert w100.writes == []
     assert w100.thermostat.pmtsd_state() == before
+
+
+# --- setpoint change tracking ----------------------------------------------------------
+
+ZCL_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
+SOURCE = Thermostat.SetpointChangeSource
+
+
+def _change_time(t):
+    return ZCL_EPOCH + timedelta(seconds=t.get(quirk.SETPOINT_CHANGE_TIMESTAMP_ATTR))
+
+
+def test_setpoint_change_untracked_until_first_change(w100):
+    assert w100.thermostat.get(quirk.SETPOINT_CHANGE_SOURCE_ATTR) is None
+    assert w100.thermostat.get(quirk.SETPOINT_CHANGE_TIMESTAMP_ATTR) is None
+
+
+async def test_setpoint_change_on_device_is_manual(w100):
+    before = datetime.now(UTC).replace(microsecond=0)
+    w100.receive(pmtsd_frame("P0_M1_T23"))
+    await w100.drain()
+    t = w100.thermostat
+    assert t.get(quirk.SETPOINT_CHANGE_SOURCE_ATTR) == SOURCE.Manual
+    assert before <= _change_time(t) <= datetime.now(UTC)
+
+
+async def test_setpoint_change_from_ha_is_external(w100):
+    before = datetime.now(UTC).replace(microsecond=0)
+    await w100.thermostat.write_attributes({"occupied_heating_setpoint": 2400})
+    t = w100.thermostat
+    assert t.get(quirk.SETPOINT_CHANGE_SOURCE_ATTR) == SOURCE.External
+    assert before <= _change_time(t) <= datetime.now(UTC)
+
+
+async def test_unchanged_setpoint_does_not_update_tracking(w100):
+    await w100.thermostat.write_attributes({"occupied_heating_setpoint": 2400})
+    w100.thermostat._attr_cache.set_value(
+        w100.thermostat.find_attribute(quirk.SETPOINT_CHANGE_TIMESTAMP_ATTR), 1
+    )
+    # The device reports the same setpoint back: not a new change.
+    w100.receive(pmtsd_frame("P0_M1_T24"))
+    await w100.drain()
+    t = w100.thermostat
+    assert t.get(quirk.SETPOINT_CHANGE_SOURCE_ATTR) == SOURCE.External
+    assert t.get(quirk.SETPOINT_CHANGE_TIMESTAMP_ATTR) == 1
+
+
+async def test_zha_formats_tracking_timestamp(w100):
+    """ZHA's sensor shows ZCL_EPOCH + seconds; check it lands at 'now'."""
+    from zha.application.platforms.sensor import SetpointChangeSourceTimestamp
+
+    await w100.thermostat.write_attributes({"occupied_heating_setpoint": 2400})
+    raw = w100.thermostat.get(quirk.SETPOINT_CHANGE_TIMESTAMP_ATTR)
+    shown = SetpointChangeSourceTimestamp.formatter(None, raw)
+    assert abs((datetime.now(UTC) - shown).total_seconds()) < 5

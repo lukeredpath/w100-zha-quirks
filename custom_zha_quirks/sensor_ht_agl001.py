@@ -80,6 +80,10 @@ HEATING_SETPOINT_ATTR = Thermostat.AttributeDefs.occupied_heating_setpoint.id
 SYSTEM_MODE_ATTR = Thermostat.AttributeDefs.system_mode.id
 RUNNING_STATE_ATTR = Thermostat.AttributeDefs.running_state.id
 FAN_MODE_ATTR = Fan.AttributeDefs.fan_mode.id
+SETPOINT_CHANGE_SOURCE_ATTR = Thermostat.AttributeDefs.setpoint_change_source.id
+SETPOINT_CHANGE_TIMESTAMP_ATTR = Thermostat.AttributeDefs.setpoint_change_source_timestamp.id
+# ZCL UTCTime counts seconds from 2000-01-01T00:00:00Z.
+ZCL_EPOCH_UNIX = 946684800
 
 # PMTSD M value <-> system_mode
 M_TO_SYSTEM_MODE = {
@@ -744,7 +748,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             # back on restores it.
             thermostat._last_m = int(updates["M"])
         if "T" in updates:
-            thermostat.set_setpoint(updates["T"] * 100)
+            thermostat.set_setpoint(updates["T"] * 100, source=Thermostat.SetpointChangeSource.Manual)
         if "D" in updates:
             thermostat._cached_d = updates["D"]
 
@@ -1160,10 +1164,21 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
 
         return p, m, t_val, s, self._cached_d
 
-    def set_setpoint(self, value):
-        """Set both setpoints; the W100 has a single target temperature (T)."""
+    def set_setpoint(self, value, *, source: Optional[Thermostat.SetpointChangeSource] = None):
+        """Set both setpoints; the W100 has a single target temperature (T).
+
+        If source is given and the setpoint actually changes, record where the
+        change came from and when, in the standard setpoint-change-tracking
+        attributes (shown by ZHA as diagnostic sensors).
+        """
+        previous = self.get(HEATING_SETPOINT_ATTR)
         self.update_attribute(HEATING_SETPOINT_ATTR, value)
         self.update_attribute(COOLING_SETPOINT_ATTR, value)
+        if source is not None and value != previous:
+            self.update_attribute(SETPOINT_CHANGE_SOURCE_ATTR, source)
+            self.update_attribute(
+                SETPOINT_CHANGE_TIMESTAMP_ATTR, int(time.time()) - ZCL_EPOCH_UNIX
+            )
 
     def set_active(self, active: bool):
         """Set system_mode to Off, or to the last-known active HVAC mode."""
@@ -1228,7 +1243,7 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
                 # Single target temperature on the device: keep both in step.
                 # The protocol only carries whole degrees, so store what the
                 # device will actually use and HA shows the real setpoint.
-                self.set_setpoint(whole_degrees(value / 100) * 100)
+                self.set_setpoint(whole_degrees(value / 100) * 100, source=Thermostat.SetpointChangeSource.External)
             else:
                 # system_mode writes also update _last_m via _update_attribute.
                 self._update_attribute(attr_id, value)
