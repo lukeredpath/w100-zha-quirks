@@ -53,7 +53,8 @@ The climate entity controls the device's system mode and target temperature (the
 ### Fan Control
 The quirk creates a separate Fan entity.
 - **Low / Medium / High:** Maps directly to the device's fan speeds.
-- **Off, Auto, and other presets:** Map to the device's "Auto" fan mode (internally handled as Speed 0).
+- **Auto:** The device's automatic fan mode (internally handled as Speed 0).
+- **Off, On and Smart:** The device has no equivalent, so these are sent as Auto and the entity shows the Auto preset.
 
 ### External Sensor Display
 Set **Sensor display mode** to `external`, then write values to **External temperature** and **External humidity**, for example from an automation that copies a weather entity. The last values written are kept across restarts and sent to the device when you switch to external mode.
@@ -68,7 +69,7 @@ You can use the buttons in Home Assistant Automations.
 - **Thermostat Mode Switch may turn itself off after a ZHA reload.** An "on" switch state has been seen to come back as off after ZHA reloaded (for example after enabling entities), because the stored value was missing when the device was reconfigured. Turn the switch back on if this happens. Being investigated.
 - **The T may briefly reappear after a Home Assistant restart.** With the switch off, the device can drift back into thermostat mode while Home Assistant is down. The quirk switches it back off when the device next checks in, usually within a minute or two.
 - **Some changes on the device aren't reflected in Home Assistant.** Some local changes (seen when cycling modes) arrive with an empty payload the quirk can't decode. Home Assistant catches up when the device next reports its state.
-- **The fan entity's Off shows as AUTO.** The device has no fan "off", only Auto and three speeds. ZHA's fan entity always offers Off, and the quirk sends it as Auto, which the display shows as AUTO with three bars.
+- **The fan can't be turned off.** The device has no fan "off", only Auto and three speeds. ZHA's fan entity always offers Off (and the On and Smart presets); the quirk sends these as Auto, and the entity switches to the Auto preset to match the display (AUTO with three bars).
 - **E02 on the display.** E02 means the device sent a change and is waiting for the hub to confirm it. The quirk acknowledges and confirms every change, so it's expected to appear only while Home Assistant or ZHA is unavailable, clearing once they're back. (Confirmation is new; if you still see E02 in normal use, please report it with debug logs.)
 
 ## Troubleshooting

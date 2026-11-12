@@ -1030,25 +1030,54 @@ class W100FanCluster(CustomCluster, Fan):
         0x0001: Fan.FanModeSequence.Low_Med_High_Auto,
     }
 
+    _DEFAULT_ATTRIBUTES = {
+        FAN_MODE_ATTR: Fan.FanMode.Auto,
+        0x0001: Fan.FanModeSequence.Low_Med_High_Auto,
+    }
+
     def __init__(self, *args, **kwargs):
         """Initialize the cluster."""
         super().__init__(*args, **kwargs)
-        self._update_attribute(0x0000, Fan.FanMode.Auto)
-        self._update_attribute(0x0001, Fan.FanModeSequence.Low_Med_High_Auto)
+        self._seed_defaults()
+
+    def _seed_defaults(self):
+        """Fill in any attributes missing from the cache.
+
+        On startup zigpy clears the cache built during __init__ and restores
+        only what was persisted, so the seeds can be missing afterwards.
+        """
+        for attr_id, default in self._DEFAULT_ATTRIBUTES.items():
+            if self.get(attr_id) is None:
+                self._update_attribute(attr_id, default)
+
+    async def read_attributes(self, attributes, allow_cache=False, only_cache=False, *args, **kwargs):
+        """Serve fan attributes from the local cache.
+
+        This is a virtual cluster on a virtual endpoint: reading it from the
+        device fails, which left the fan entity off with no preset after a
+        restart (ZHA reads fan_mode on startup).
+        """
+        self._seed_defaults()
+        return await super().read_attributes(attributes, True, True, *args, **kwargs)
 
     async def write_attributes(self, attributes, manufacturer=None):
         """Intercept write attributes."""
         if "fan_mode" in attributes or 0x0000 in attributes:
             val = attributes.get("fan_mode", attributes.get(0x0000))
+            # The device only has Auto and three speeds; anything else (Off,
+            # On, Smart) is sent as Auto. Store what was actually sent so HA
+            # shows what the device shows.
+            effective = val if val in FAN_MODE_TO_S else Fan.FanMode.Auto
             _LOGGER.debug(
-                "W100FanCluster: Writing fan_mode %s -> S=%s",
+                "W100FanCluster: Writing fan_mode %s -> %s (S=%s)",
                 val,
-                FAN_MODE_TO_S.get(val, 0),
+                effective,
+                FAN_MODE_TO_S.get(effective, 0),
             )
 
             # The PMTSD S value is derived from this attribute, so update it
             # first and then send the current state.
-            self._update_attribute(FAN_MODE_ATTR, val)
+            self._update_attribute(FAN_MODE_ATTR, effective)
 
             ep1 = self.endpoint.device.endpoints.get(1)
             manu_cluster = ep1.in_clusters.get(W100ManuSpecificCluster.cluster_id) if ep1 else None

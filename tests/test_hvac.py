@@ -201,13 +201,41 @@ def test_fan_defaults(w100):
     assert w100.fan.get(0x0001) == Fan.FanModeSequence.Low_Med_High_Auto
 
 
+async def test_fan_read_after_restart_serves_defaults_without_device_read(w100, monkeypatch):
+    """ZHA reads fan_mode on startup; the virtual fan cluster can't be read from the device."""
+    async def boom(*args, **kwargs):
+        raise AssertionError("device read attempted")
+
+    monkeypatch.setattr(w100.fan, "read_attributes_raw", boom)
+    w100.restart({})
+    success, failure = await w100.fan.read_attributes(["fan_mode", "fan_mode_sequence"])
+    assert success == {"fan_mode": Fan.FanMode.Auto, "fan_mode_sequence": Fan.FanModeSequence.Low_Med_High_Auto}
+    assert failure == {}
+
+
+async def test_fan_read_after_restart_keeps_persisted_mode(w100):
+    w100.restart({(21, 0x0202, quirk.FAN_MODE_ATTR): Fan.FanMode.High})
+    success, _ = await w100.fan.read_attributes([quirk.FAN_MODE_ATTR])
+    assert success == {quirk.FAN_MODE_ATTR: Fan.FanMode.High}
+
+
 @pytest.mark.parametrize(
-    ("mode", "s"),
-    [(Fan.FanMode.Low, 1), (Fan.FanMode.Medium, 2), (Fan.FanMode.High, 3), (Fan.FanMode.Auto, 0), (Fan.FanMode.On, 0)],
+    ("mode", "s", "stored"),
+    [
+        (Fan.FanMode.Low, 1, Fan.FanMode.Low),
+        (Fan.FanMode.Medium, 2, Fan.FanMode.Medium),
+        (Fan.FanMode.High, 3, Fan.FanMode.High),
+        (Fan.FanMode.Auto, 0, Fan.FanMode.Auto),
+        # The device has no off/on/smart: these are sent, and stored, as Auto
+        # so HA shows what the device displays.
+        (Fan.FanMode.Off, 0, Fan.FanMode.Auto),
+        (Fan.FanMode.On, 0, Fan.FanMode.Auto),
+        (Fan.FanMode.Smart, 0, Fan.FanMode.Auto),
+    ],
 )
-async def test_fan_write_sends_s(w100, mode, s):
+async def test_fan_write_sends_s(w100, mode, s, stored):
     result = await w100.fan.write_attributes({"fan_mode": mode})
-    assert w100.fan.get(quirk.FAN_MODE_ATTR) == mode
+    assert w100.fan.get(quirk.FAN_MODE_ATTR) == stored
     assert w100.frames == [f"P1_M0_T20_S{s}_D0"]
     assert result == [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS, attrid=0x0000)]]
 

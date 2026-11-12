@@ -166,6 +166,18 @@ Until the device reports its real state, the virtual thermostat assumes
 `system_mode=Off` (`P=1`). That way the quirk won't send PMTSD frames that turn
 on a device the user has switched off.
 
+### Fan entity
+
+- **Off showed as off in HA but AUTO on the device.** The device has no fan
+  "off" (or the On/Smart presets ZHA also offers), so these are sent as Auto
+  (`S0`). Upstream stored the value HA wrote, so the entity said off while the
+  display showed AUTO. The value actually sent (Auto) is now stored, so the
+  entity shows the Auto preset.
+- **The fan came up off with no preset after a restart.** ZHA reads
+  `fan_mode` from the device at startup, but the fan cluster is virtual (on an
+  endpoint the quirk adds), so the read failed. Reads are now answered from
+  the attribute cache, with Auto as the default, like the thermostat cluster.
+
 ### External sensor mode
 
 Writing the tests turned up three bugs in the external temperature/humidity
