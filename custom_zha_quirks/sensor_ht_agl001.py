@@ -182,16 +182,26 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
     _DEFAULT_EXTERNAL_HUMIDITY = 50.0
 
     def __init__(self, *args, **kwargs):
-        """Initialize the cluster with cached external sensor values."""
+        """Initialize the cluster."""
         super().__init__(*args, **kwargs)
-        self._cached_external_temperature = self._DEFAULT_EXTERNAL_TEMPERATURE
-        self._cached_external_humidity = self._DEFAULT_EXTERNAL_HUMIDITY
         # Strong references to fire-and-forget tasks so they aren't GC'd
         # before completion.
         self._background_tasks: set[asyncio.Task] = set()
-        # Initialize the attribute cache with default values
-        self._update_attribute(self.AttributeDefs.external_temperature.id, self._cached_external_temperature)
-        self._update_attribute(self.AttributeDefs.external_humidity.id, self._cached_external_humidity)
+
+    @property
+    def _cached_external_temperature(self) -> float:
+        """Last external temperature written, or the default.
+
+        Backed by the (persisted) attribute rather than an instance field, so it
+        survives restarts. Seeding the attribute in __init__ doesn't work: the
+        v2 quirk builder replaces this cluster's cache with the original's.
+        """
+        return self.get(self.AttributeDefs.external_temperature.id, self._DEFAULT_EXTERNAL_TEMPERATURE)
+
+    @property
+    def _cached_external_humidity(self) -> float:
+        """Last external humidity written, or the default (see above)."""
+        return self.get(self.AttributeDefs.external_humidity.id, self._DEFAULT_EXTERNAL_HUMIDITY)
 
     @staticmethod
     def _lumi_header(counter: int, length: int, action: int) -> bytes:
@@ -260,14 +270,16 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
 
         # Either a Write Attributes Response (status_records) or a Default
         # Response (status). Older zigpy returned [records] as a plain list.
-        records = getattr(result, "status_records", None)
-        if records is None and isinstance(result, (list, tuple)) and result:
-            records = result[0]
-        if records is not None:
-            failures = [r.status for r in records if r.status != foundation.Status.SUCCESS]
+        # Check the schema attributes first: zigpy command schemas are tuples.
+        if hasattr(result, "status_records"):
+            statuses = [r.status for r in result.status_records]
+        elif hasattr(result, "status"):
+            statuses = [result.status]
+        elif isinstance(result, list) and result:
+            statuses = [r.status for r in result[0]]
         else:
-            status = getattr(result, "status", foundation.Status.SUCCESS)
-            failures = [] if status == foundation.Status.SUCCESS else [status]
+            statuses = []
+        failures = [s for s in statuses if s != foundation.Status.SUCCESS]
 
         if failures:
             raise RuntimeError(f"W100 control frame write rejected: {failures}")
@@ -356,9 +368,11 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             
             # Small delay to ensure mode switch is processed
             await asyncio.sleep(0.3)
-            await self._send_external_measurement("temperature", self._cached_external_temperature)
+            # force=True: the sensor attribute still holds the previous
+            # (internal) mode at this point, and would otherwise suppress these.
+            await self._send_external_measurement("temperature", self._cached_external_temperature, force=True)
             await asyncio.sleep(0.1)
-            await self._send_external_measurement("humidity", self._cached_external_humidity)
+            await self._send_external_measurement("humidity", self._cached_external_humidity, force=True)
         else:
             params1 = timestamp + bytes([0x15]) + device + (b"\x00" * 12)
             params2 = timestamp + bytes([0x14]) + device + (b"\x00" * 12)
@@ -376,9 +390,13 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
 
         self._update_attribute(self.AttributeDefs.sensor.id, normalized)
 
-    async def _send_external_measurement(self, kind: str, value: Any) -> None:
+    async def _send_external_measurement(self, kind: str, value: Any, *, force: bool = False) -> None:
         sensor_mode = self.get(self.AttributeDefs.sensor.id)
-        if sensor_mode is not None and self._normalize_sensor_mode(sensor_mode) != int(W100ExternalSensorMode.external):
+        if (
+            not force
+            and sensor_mode is not None
+            and self._normalize_sensor_mode(sensor_mode) != int(W100ExternalSensorMode.external)
+        ):
             _LOGGER.debug("W100: Ignoring %s update while sensor mode is internal", kind)
             return
 
@@ -413,13 +431,12 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             val = attributes.get(
                 "external_temperature", attributes.get(self.AttributeDefs.external_temperature.id)
             )
-            # Cache the value for use when switching to external mode
-            self._cached_external_temperature = float(val)
-            _LOGGER.debug("W100: Cached external temperature: %.1f", self._cached_external_temperature)
+            _LOGGER.debug("W100: External temperature: %.1f", float(val))
             try:
                 await self._send_external_measurement("temperature", val)
             finally:
-                # Keep last value in cache for the HA UI
+                # Keep the last value for the HA UI and for when switching to
+                # external mode (see _cached_external_temperature).
                 self._update_attribute(self.AttributeDefs.external_temperature.id, float(val))
             return [
                 [
@@ -432,9 +449,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
 
         if "external_humidity" in attributes or self.AttributeDefs.external_humidity.id in attributes:
             val = attributes.get("external_humidity", attributes.get(self.AttributeDefs.external_humidity.id))
-            # Cache the value for use when switching to external mode
-            self._cached_external_humidity = float(val)
-            _LOGGER.debug("W100: Cached external humidity: %.1f", self._cached_external_humidity)
+            _LOGGER.debug("W100: External humidity: %.1f", float(val))
             try:
                 await self._send_external_measurement("humidity", val)
             finally:
@@ -473,35 +488,26 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             manufacturer = 0x115F
 
         # These are virtual config attributes (used only to trigger writes).
-        # Serve them from cache to avoid unsupported attribute reads.
-        virtual_ids = {
-            self.AttributeDefs.external_temperature.id,
-            self.AttributeDefs.external_humidity.id,
+        # Serve them locally to avoid unsupported attribute reads.
+        virtual_values = {
+            self.AttributeDefs.external_temperature.id: lambda: self._cached_external_temperature,
+            self.AttributeDefs.external_humidity.id: lambda: self._cached_external_humidity,
         }
 
-        requested_ids: list[int] = []
+        success: dict[Any, Any] = {}
+        failure: dict[Any, Any] = {}
         passthrough: list[Any] = []
         for attr in attributes:
             if isinstance(attr, str) and attr in self.attributes_by_name:
                 attr_id = self.attributes_by_name[attr].id
-            elif isinstance(attr, int):
+            else:
                 attr_id = attr
+
+            if attr_id in virtual_values:
+                # Key results the way the caller asked (name or ID), as zigpy does.
+                success[attr] = virtual_values[attr_id]()
             else:
                 passthrough.append(attr)
-                continue
-
-            if attr_id in virtual_ids:
-                requested_ids.append(attr_id)
-            else:
-                passthrough.append(attr)
-
-        success: dict[Any, Any] = {}
-        failure: dict[Any, Any] = {}
-
-        for attr_id in requested_ids:
-            cached = self.get(attr_id)
-            if cached is not None:
-                success[attr_id] = cached
 
         if passthrough:
             s, f = await super().read_attributes(
@@ -795,9 +801,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         control = b"\x18"
 
         frame = prefix + frame_id + seq + control + dev_mac
-        if len(frame) < 34:
-            frame += b"\x00" * (34 - len(frame))
-        return frame
+        return frame.ljust(34, b"\x00")
 
     def _build_thermostat_on_frame(self) -> bytes:
         """Build the thermostat-feature registration ("ON") frame (~60 bytes)."""

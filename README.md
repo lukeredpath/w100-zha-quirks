@@ -57,3 +57,18 @@ You can use the buttons in Home Assistant Automations.
 
 - **Entities missing?** Try removing the device from ZHA and pairing it again.
 - **Logs:** Check Home Assistant logs for `zhaquirks.xiaomi.aqara.sensor_ht_agl001` for debug information.
+
+## Development
+
+The quirk has an automated test suite that runs it against the real zigpy/ZHA
+stack with the Zigbee radio mocked out. Tests live in `tests/` and coverage of
+`sensor_ht_agl001.py` is enforced at 100% (lines and branches).
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r requirements_test.txt
+.venv/bin/pytest
+```
+
+`requirements_test.txt` pins the ZHA, zigpy and zha-quirks versions the quirk is
+tested against; bump them to match the Home Assistant release you're targeting.

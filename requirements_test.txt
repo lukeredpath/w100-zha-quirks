@@ -1,0 +1,8 @@
+# Versions the quirk is tested against (Home Assistant's bundled ZHA stack).
+zha==2.4.3
+zigpy==2.4.1
+zha-quirks==2.4.1
+
+pytest==9.2.0
+pytest-asyncio==1.5.0
+pytest-cov==7.1.0

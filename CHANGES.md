@@ -2,7 +2,9 @@
 
 This fork tracks [Pulzki/w100-zha-quirks](https://github.com/Pulzki/w100-zha-quirks).
 It is based on upstream `c335919` (merge of PR #6, external temperature/humidity
-sensor support). Every change below is in `custom_zha_quirks/sensor_ht_agl001.py`.
+sensor support). Every quirk change below is in
+`custom_zha_quirks/sensor_ht_agl001.py`. The fork also adds an automated test
+suite (see [Tests](#tests)).
 
 ## Fixes
 
@@ -19,8 +21,9 @@ builds the attribute record by hand (ZCL octet string, type `0x41`) and calls
 thermostat mode frames use it.
 
 `write_attributes_raw` does no status checking of its own, so the helper now
-checks the response itself. If the device rejects a frame, the helper raises
-instead of treating the write as a success.
+checks the response itself, whether it's a Write Attributes Response or a Default
+Response. If the device rejects a frame, the helper raises instead of treating
+the write as a success.
 
 ### Thermostat Mode Switch not staying off
 
@@ -94,7 +97,7 @@ These values are now worked out from the attributes zigpy saves:
 | `M` | `system_mode` (`Cool`/`Heat`/`Auto` → `0`/`1`/`2`). While off, the last active mode is used. |
 | `T` | the heating setpoint, or the cooling setpoint in `Cool` mode |
 | `S` | the fan cluster's `fan_mode` |
-| `D` | echoed back unchanged (its meaning is unknown) |
+| `D` | the last value the device reported, echoed back (its meaning is unknown; not saved, so `0` after a restart until the device reports it) |
 
 The device has a single target temperature, so writing either setpoint now
 updates both.
@@ -116,6 +119,30 @@ Until the device reports its real state, the virtual thermostat assumes
 `system_mode=Off` (`P=1`). That way the quirk won't send PMTSD frames that turn
 on a device the user has switched off.
 
+### External sensor mode
+
+Writing the tests turned up three bugs in the external temperature/humidity
+support added in upstream PR #6:
+
+- **Switching to external mode didn't send the stored measurements.** After the
+  mode-change frames, the quirk sends the last external temperature and
+  humidity. But `_send_external_measurement` skips sending unless the `sensor`
+  attribute already says "external", and that attribute is only updated
+  afterwards. So when switching from internal mode, the usual case, nothing was
+  sent until the next value was written. These two sends now bypass that check.
+- **The external values didn't survive a restart.** They were held in instance
+  fields that went back to 20 °C / 50 % on every restart. They are now read
+  from the saved `external_temperature` and `external_humidity` attributes,
+  with 20 °C / 50 % as the fallback when nothing has been written yet.
+- **The default values were never set.** `__init__` wrote 20 °C / 50 % into the
+  attribute cache. For a cluster added with `.replaces()`, zigpy's v2 quirk
+  builder then overwrites that cache with the original cluster's, so the
+  defaults were lost and reads returned nothing. Reads now return the fallback
+  values described above.
+
+Reads of these two attributes are also returned under the key the caller used
+(name or ID), as with the thermostat cluster, rather than always by ID.
+
 ### Reporting configuration
 
 The `configure_reporting` calls for the custom temperature (`0x0163`) and humidity
@@ -132,9 +159,30 @@ manufacturer code from the attribute definitions, which are marked
   IEEE address inline.
 - The thermostat and fan attribute IDs and the PMTSD `M`/`S` mappings are now
   defined once as module-level constants.
+- The "thermostat off" frame is padded with `ljust` instead of a length check
+  that was always true.
 
 ## Diagnostics
 
 - Each PMTSD frame is logged at debug level when it is sent.
 - Each heartbeat is logged at debug level, along with the current thermostat
   feature state.
+
+## Tests
+
+Upstream has no tests. This fork adds a pytest suite in `tests/` that loads the
+quirk through ZHA's real device registry, with only the Zigbee radio mocked. It
+covers:
+
+- thermostat mode switching, heartbeat replies and control-frame write status
+- behaviour after a restart, by mimicking how zigpy clears and restores the
+  attribute cache on startup
+- `apply_custom_configuration`, including when individual steps fail
+- the virtual thermostat and fan clusters, and PMTSD frames reported by the
+  device
+- buttons, battery parsing, external sensor mode, the Basic cluster and the
+  device's cluster lookup
+
+Coverage of `sensor_ht_agl001.py` is enforced at 100% (lines and branches).
+`requirements_test.txt` pins the versions the suite runs against: ZHA 2.4.3,
+zigpy 2.4.1 and zha-quirks 2.4.1. See the README for how to run it.
